@@ -1,0 +1,6 @@
+registries:
+  - name: local
+    description: Leo's local sparkrun recipes (DGX Spark homelab)
+    recipes: recipes
+    mods: recipes/mods
+    visible: true
