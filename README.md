@@ -7,8 +7,10 @@ Local recipe registry for the DGX Spark homelab (2x GB10, nodes `spark-f31f`
 sparkrun-recipes/
 ├── .sparkrun/registry.yaml          # registry manifest (name: local)
 └── recipes/
-    ├── deepseek-v4-flash.yaml       # the recipe
-    ├── deepseek-v4-flash.env        # standalone env file (mirrors the recipe env: block)
+    ├── mimo-v2.5-dflash.yaml        # MiMo-V2.5 NVFP4 + DFlash recipe
+    ├── mimo-v2.5-dflash.env         # standalone env file (mirrors the recipe env: block)
+    ├── ornith-1.0-397b.yaml         # Ornith-1.0-397B INT4 (W4A16 AutoRound) recipe
+    ├── ornith-1.0-397b.env          # standalone env file (mirrors the recipe env: block)
     └── mods/                        # recipe mods (empty for now)
 ```
 
@@ -17,14 +19,14 @@ sparkrun-recipes/
 By file path (works immediately, no registration):
 
 ```bash
-sparkrun run sparkrun-recipes/recipes/deepseek-v4-flash.yaml \
+sparkrun run sparkrun-recipes/recipes/mimo-v2.5-dflash.yaml \
   --tp 2 --hosts 169.254.225.22,169.254.17.50
 ```
 
 By name (after registering this dir as a registry — see below):
 
 ```bash
-sparkrun run deepseek-v4-flash --tp 2 --cluster <your-2node-cluster>
+sparkrun run mimo-v2.5-dflash --tp 2 --cluster <your-2node-cluster>
 ```
 
 ## Registering as a local registry
@@ -35,31 +37,62 @@ can treat it like any other registry (git can clone from a local path):
 ```bash
 sparkrun registry add /home/leo/sparkrun-recipes
 sparkrun registry update
-sparkrun list | grep -i deepseek
+sparkrun list | grep -iE 'mimo|ornith'
 ```
 
 To remove it later: `sparkrun registry remove local`.
 
-## deepseek-v4-flash — caveats
+> **DeepSeek-V4-Flash lives elsewhere now.** The local `deepseek-v4-flash` recipe
+> was removed — the homelab runs the published `@experimental/deepseek4-flash-fp8-mtp-vllm`
+> recipe instead (see `make deepseek` in the Makefile), so keeping a divergent local
+> copy was just a maintenance hazard.
 
-This is the community **"Aiden" recipe** from the NVIDIA developer forums
-([thread](https://forums.developer.nvidia.com/t/deepseek-v4-flash-aiden-recipe-from-reddit-1m-token-session-operational-cuda-12-1-tailored-for-dgx-spark-gb10/372268)).
-It is **unverified on this host**. Things to know before relying on it:
+## mimo-v2.5-dflash — caveats
 
-- **2 Sparks required** (`cluster_only`, `min_nodes: 2`). One GB10 per Spark →
-  `tensor_parallel: 2` needs both nodes. It cannot run solo.
-- **Custom image** `aidendle94/sparkrun-vllm-ds4-gb10:production-ready` (~large,
-  first pull/sync is slow) with a baked-in `dsv4-vllm-entrypoint` and DeepSeek-V4
-  patches. It is a third-party image — inspect/trust accordingly.
-- **CUDA arch is pinned to `12.1a`** (`TORCH_CUDA_ARCH_LIST` / `FLASHINFER_CUDA_ARCH_LIST`)
-  for GB10 Blackwell. Don't change unless you know your arch.
-- **Multi-node coordination flags omitted.** The forum command passes
-  `--nnodes 2 --node-rank ${NODE_RANK} --master-addr ${MASTER_ADDR} --master-port 25000
-  ${HEADLESS:+--headless}` because it was written for raw docker-compose. sparkrun's
-  `vllm-distributed` runtime does this coordination itself, so they're left out of the
-  recipe command. **If the entrypoint refuses to start without them**, re-add that line
-  to the `command:` block in `deepseek-v4-flash.yaml` (sparkrun exposes `NODE_RANK` /
-  `MASTER_ADDR` in the container env; the env file documents the values).
-- **Performance baseline from the author:** ~30 tok/s decode at 980K context, with a
-  ~16-minute time-to-first-token. The 1M-token window is real but very slow to fill.
-- Keep `deepseek-v4-flash.env` in sync with the `env:` block in the YAML if you edit either.
+Community recipe from
+[DoctorMasterNewb/vLLM-Mimo-V2.5-Dflash-2x-DGX-Spark](https://github.com/DoctorMasterNewb/vLLM-Mimo-V2.5-Dflash-2x-DGX-Spark):
+Xiaomi **MiMo-V2.5** (`lukealonso/MiMo-V2.5-NVFP4`, NVFP4 weights, ~170 GB)
+served across both Sparks with a **DFlash block-diffusion drafter** for
+speculative decoding. It is **unverified on this host**. Before relying on it:
+
+- **2 Sparks required** (`cluster_only`, `min_nodes: 2`). Cross-node
+  `tensor_parallel: 2`, one GB10 per node. It cannot run solo.
+- **No canonical container image.** Upstream builds vLLM **≥ 0.23.1 nightly**
+  (validated `0.23.1rc1.dev537`, 2026-06-28, with the `dflash` spec method
+  registered) from the `eugr/spark-vllm-docker` base, applies **four MiMo/DFlash
+  patches** (MiMo-V2 config registration, NVFP4 fused-QKV load fix, vision-merger
+  packed-weight load, and PR #46104 for SWA+DFlash on the Triton backend), and
+  bakes the chat template into the image. It also needs **PR #45181** (mixed KV
+  page sizes) and `transformers` 5.x. The `container:` tag in the recipe
+  (`eugr/spark-vllm-docker:mimo-v2.5-dflash-nightly`) is a **placeholder** —
+  build/push your own image from that repo and swap the tag in.
+- **Pre-download the drafter on BOTH nodes.** `XiaomiMiMo/MiMo-V2.5-DFlash`
+  (~2.9 GB) must be local to each TP rank. Upstream:
+  `scripts/download-drafter.sh ~/.cache/huggingface/dflash-mimo-v2.5`. The recipe
+  points `--speculative-config` at `defaults.drafter_dir`
+  (`/root/.cache/huggingface/dflash-mimo-v2.5/dflash`) — make sure that path
+  resolves to the downloaded drafter inside the container on each node, or
+  override `-o drafter_dir=…`.
+- **Tight KV memory headroom.** 170 GB weights + drafter + profiling peak at
+  `gpu_memory_utilization: 0.83`; `max_model_len` is 131072 with bf16 KV. Don't
+  push GMU much higher.
+- **First cold load is slow.** ~170 GB is pulled/loaded at serve time — upstream
+  wraps the launch in systemd with `TimeoutStartSec=3600`. If sparkrun has a
+  startup timeout, give it plenty of room.
+- **CUDA arch pinned to `12.1a`** for GB10 Blackwell. `TORCH_CUDA_ARCH_LIST` is
+  from upstream; `FLASHINFER_CUDA_ARCH_LIST` is added here for repo parity.
+- **NCCL knobs differ from the Ornith recipe on purpose** — MiMo uses the
+  upstream author's tuning (`NCCL_PROTO=LL`, `NCCL_MAX_NCHANNELS=2`,
+  `NCCL_NET_GDR_LEVEL=LOC`, `NCCL_NVLS_ENABLE=0`), not the standard IB settings
+  in `ornith-1.0-397b.env`.
+- **Multi-node flags omitted / no explicit ray backend.** Upstream `serve.sh` is
+  a plain `vllm serve`; sparkrun's `vllm-distributed` runtime handles head/worker
+  coordination. If cross-node TP=2 won't initialize, add
+  `--distributed-executor-backend ray` to the `command:` block (as
+  `ornith-1.0-397b.yaml` does).
+- **Speculation payoff is workload-dependent.** Baseline ~22 tok/s (single
+  stream, cross-node TP=2); with DFlash ~22–67 tok/s — structured/tool output
+  accepts 6+ drafts, free-form prose at nonzero temperature is the worst case
+  (~1.5×).
+- Keep `mimo-v2.5-dflash.env` in sync with the `env:` block in the YAML if you
+  edit either.

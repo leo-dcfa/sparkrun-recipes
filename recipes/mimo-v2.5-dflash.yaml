@@ -1,0 +1,115 @@
+# Recipe: MiMo-V2.5-NVFP4 + DFlash speculative decoding for DGX Spark GB10
+# Source: https://github.com/DoctorMasterNewb/vLLM-Mimo-V2.5-Dflash-2x-DGX-Spark
+#
+# Xiaomi MiMo-V2.5 (NVFP4 weights) served on 2x DGX Spark (GB10) with cross-node
+# TP=2, and a DFlash *block-diffusion* drafter for speculative decoding (drafts a
+# whole 8-token block per forward pass, so num_speculative_tokens = 7).
+# COMMUNITY / UNVERIFIED on this host. See README.md for caveats — in particular
+# the from-source container build, the pre-downloaded drafter, and the tight KV
+# memory headroom.
+
+recipe_version: "1"
+name: MiMo-V2.5-DFlash
+model: lukealonso/MiMo-V2.5-NVFP4
+runtime: vllm-distributed
+min_nodes: 2
+
+# Requires two Sparks (1 GB10 each -> tensor_parallel 2). Will not run solo.
+cluster_only: true
+
+# NOTE: no canonical published tag upstream. The recipe author builds vLLM
+# (>= 0.23.1 nightly, validated 0.23.1rc1.dev537 / 2026-06-28) via the
+# eugr/spark-vllm-docker base, applies four MiMo/DFlash patches, and bakes the
+# chat template + drafter mods into the image. The tag below is a PLACEHOLDER for
+# the image you build/push from that repo — replace it with your own tag. See
+# README.md ("MiMo-V2.5-DFlash — caveats").
+container: eugr/spark-vllm-docker:mimo-v2.5-dflash-nightly
+
+metadata:
+  description: MiMo-V2.5 NVFP4 on 2x DGX Spark GB10 with DFlash block-diffusion speculative decoding
+  maintainer: DoctorMasterNewb (GitHub) / community
+  source: https://github.com/DoctorMasterNewb/vLLM-Mimo-V2.5-Dflash-2x-DGX-Spark
+  model_dtype: nvfp4
+  draft_method: dflash
+  vllm_version: "0.23.1"  # >= 0.23.1 nightly with the `dflash` spec method registered
+
+# Defaults — override on the CLI with -o key=value or the dedicated flags.
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  served_model_name: MiMo-V2.5-NVFP4
+  tensor_parallel: 2
+  pipeline_parallel: 1
+  gpu_memory_utilization: 0.83   # tight: 170 GB weights + drafter + profiling peak
+  max_model_len: 131072
+  max_num_seqs: 4
+  max_num_batched_tokens: 4096
+  kv_cache_dtype: bfloat16
+  num_speculative_tokens: 7      # DFlash drafts an 8-token block -> 8 - 1
+  # Path to the pre-downloaded DFlash drafter (XiaomiMiMo/MiMo-V2.5-DFlash, ~2.9 GB).
+  # MUST exist locally on BOTH nodes / be visible at this path inside the container
+  # (the drafter has to be local to each TP rank). See README + scripts/download-drafter.sh.
+  drafter_dir: /root/.cache/huggingface/dflash-mimo-v2.5/dflash
+  # Chat template baked into the image (vendored from PR #46104).
+  chat_template: /opt/mimo-dflash/mods/mimo-dflash-pr46104/chat_template.jinja
+
+# Environment variables (kept in sync with mimo-v2.5-dflash.env — see README).
+# These mirror the upstream scripts/serve.sh exports. NOTE: MiMo's NCCL tuning
+# differs from the DeepSeek recipe's IB settings — this is the upstream author's
+# tuning for the GB10 interconnect; keep it as-is unless you have a reason.
+env:
+  PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+  VLLM_ALLOW_LONG_MAX_MODEL_LEN: 1
+  # NVFP4 GEMM + FlashInfer FP4 MoE kernels (GB10 / SM121).
+  VLLM_NVFP4_GEMM_BACKEND: flashinfer-cutlass
+  VLLM_USE_FLASHINFER_MOE_FP4: 1
+  VLLM_FLASHINFER_MOE_BACKEND: throughput
+  VLLM_WORKER_MULTIPROC_METHOD: fork
+  # CUDA arch (GB10 = sm_121a / Blackwell). TORCH_* is from upstream serve.sh;
+  # FLASHINFER_* is added for parity with this repo's convention (build-time arch).
+  TORCH_CUDA_ARCH_LIST: 12.1a
+  FLASHINFER_CUDA_ARCH_LIST: 12.1a
+  # NCCL over the ConnectX-7 link between the two Sparks (upstream tuning).
+  NCCL_CUMEM_ENABLE: 0
+  NCCL_NVLS_ENABLE: 0
+  NCCL_MAX_NCHANNELS: 2
+  NCCL_NET_GDR_LEVEL: LOC
+  NCCL_PROTO: LL
+
+# Serve command template.
+#
+# Mirrors upstream scripts/serve.sh (a plain `vllm serve`, not a custom
+# entrypoint). Multi-node flags (--nnodes/--node-rank/--master-addr/--headless)
+# are NOT hand-added: sparkrun's vllm-distributed runtime performs head/worker
+# coordination itself. Upstream's serve.sh also omits an explicit
+# --distributed-executor-backend; if cross-node TP=2 fails to initialize, add
+#     --distributed-executor-backend ray
+# (as the deepseek-v4-flash recipe does). See README.md.
+command: |
+  vllm serve {model} \
+      --served-model-name {served_model_name} \
+      --trust-remote-code \
+      --dtype auto \
+      --kv-cache-dtype {kv_cache_dtype} \
+      --hf-overrides '{"architectures":["MiMoV2OmniForCausalLM"]}' \
+      --chat-template {chat_template} \
+      --default-chat-template-kwargs '{"enable_thinking":false}' \
+      --reasoning-config '{"reasoning_start_str":"<think>","reasoning_end_str":"</think>"}' \
+      --generation-config vllm \
+      --override-generation-config '{"temperature":1.0,"top_p":0.95,"repetition_penalty":1.05,"max_new_tokens":16384}' \
+      --limit-mm-per-prompt '{"image":4}' \
+      --speculative-config '{"method":"dflash","model":"{drafter_dir}","num_speculative_tokens":{num_speculative_tokens},"attention_backend":"TRITON_ATTN"}' \
+      --enforce-eager \
+      --host {host} \
+      --port {port} \
+      --tensor-parallel-size {tensor_parallel} \
+      --pipeline-parallel-size {pipeline_parallel} \
+      --gpu-memory-utilization {gpu_memory_utilization} \
+      --max-model-len {max_model_len} \
+      --max-num-seqs {max_num_seqs} \
+      --max-num-batched-tokens {max_num_batched_tokens} \
+      --enable-prefix-caching \
+      --enable-chunked-prefill \
+      --enable-auto-tool-choice \
+      --tool-call-parser mimo \
+      --reasoning-parser mimo
