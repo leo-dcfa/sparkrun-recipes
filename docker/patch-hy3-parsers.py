@@ -9,10 +9,14 @@ in both parser files, in place, inside the image.
 
 This is the reproducible form of the one-line patch that originally produced
 eugr/spark-vllm:hy3-opensource (whose Dockerfile was lost to an ephemeral
-scratchpad). It targets the most likely code shape:  ...get("token_suffix", "")...
-and FAILS LOUDLY if it can't find that pattern — if the build fails here, inspect
-the two files inside eugr/spark-vllm:latest and update SUFFIX_RE / the default
-below (see README.md, "hy3-295b-nvfp4 — caveats", runbook step B).
+scratchpad). Verified against the live image 2026-07-09: both parsers contain
+
+    self.suffix: str = init_kwargs.get("token_suffix") or ""
+
+and the patch rewrites the trailing empty-string fallback to ":opensource". It
+FAILS LOUDLY if it can't find that pattern — if the build fails here, the parser
+source has drifted; inspect the two files inside eugr/spark-vllm:latest and update
+SUFFIX_RE below (see README.md, "hy3-295b-nvfp4 — caveats", runbook step B).
 """
 import pathlib
 import re
@@ -21,8 +25,9 @@ import sys
 import vllm
 
 SENTINEL = ":opensource"
-# Matches  "token_suffix", ""   or   'token_suffix', ''   (an empty-string default).
-SUFFIX_RE = re.compile(r"""(['"]token_suffix['"]\s*,\s*)(['"])\2""")
+# Matches  get("token_suffix") or ""   (an empty-string `or` fallback), tolerating
+# either quote style and surrounding whitespace.
+SUFFIX_RE = re.compile(r"""(get\(\s*['"]token_suffix['"]\s*\)\s+or\s+)(['"])\2""")
 
 root = pathlib.Path(vllm.__file__).parent
 targets = sorted(
