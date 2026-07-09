@@ -124,10 +124,11 @@ serving Tencent **Hy3 / Hunyuan 3** (295B total, 21B active MoE, 192 experts top
 3.8B MTP layer; Apache-2.0, released **2026-07-06**) requantized to weight-only
 **NVFP4 (W4A16)** as [`kodelow/Hy3-NVFP4-W4A16`](https://huggingface.co/kodelow/Hy3-NVFP4-W4A16)
 (~168 GiB / 99 shards). This recipe **diverges from the forum/tonyd2wild version on
-purpose** — three of their settings are wrong or unsafe on this homelab (see below).
-Verified so far: download, image, parser fix, cross-node NCCL rendezvous. **A live
-serve + inference is not yet confirmed** — treat it as unverified until you run the
-runbook below.
+purpose** — several of their settings are wrong or unsafe on this homelab (see below).
+**VERIFIED WORKING 2026-07-09**: live cross-node serve + inference confirmed on the
+2× Spark cluster — coherent English (no fp8-KV drift), working tool calls, ~112K ctx.
+The default `defaults`/`env` in the YAML ARE that verified config, so plain `make hy3`
+launches it; the overrides below are only for deviating from it.
 
 - **Only the 4-bit quant fits.** Hy3 ships BF16 (~598 GB) and `tencent/Hy3-FP8`
   (~295 GB) — **neither fits** the two Sparks' ~243 GB combined usable memory. This
@@ -150,26 +151,31 @@ runbook below.
   start/end tokens"). The fix defaults that suffix to `:opensource`. **tonyd2wild's
   `sed` patch does NOT apply** — its literal bare-token strings don't exist in this
   newer parser; patch the default in the parser source instead (see the Dockerfile).
-- **`load_format: instanttensor` is mandatory here — never `fastsafetensors`.** On
-  2026-07-08 a run with `--load-format fastsafetensors` host-buffered shards, spiked
-  free RAM to ~500 MiB **during weight load**, tripped earlyoom → a rank was killed →
-  the survivor hung on the next NCCL `BROADCAST` (600 s timeout) → **the peer wedged
-  and needed a physical power-cycle**. `instanttensor` (eugr's streaming loader, used
-  by every other 2-node recipe here) keeps the load-time peak low and is the single
-  most important safety setting in this recipe.
-- **Memory/context: GMU 0.85 + bf16 KV → ~115K ctx is the safe default.** GB10 is
-  unified memory (~121 GiB shared CPU+GPU) with earlyoom running, so a too-high GMU
-  or a load-time spike gets the vLLM worker SIGKILLed. The forum runs `0.90`; **0.90
-  OOM-wedged the peer here.** `0.85` is the homelab fleet ceiling (the `minimax`
-  M2.7 NVFP4 recipe runs it), leaves ~18 GiB free RAM at steady state, and is safe
-  *because* instanttensor
-  removes the load spike. **Do not exceed 0.85.** `max_model_len` is `114688`
-  (~112K) — confirm it fits with `make hy3-dry` before launching.
-- **bf16 KV on purpose.** The checkpoint ships **without KV calibration scales**, so
-  uncalibrated fp8 KV can cause **language drift** (occasional Chinese output in
-  English contexts). The recipe defaults `kv_cache_dtype: auto` (bf16). Only set
-  `-o kv_cache_dtype=fp8` on a KV-calibrated revision — and spot-check quality if
-  you do. (fp8 KV would roughly double the context ceiling.)
+- **`load_format: auto` is load-bearing — NOT `instanttensor`, NOT `fastsafetensors`.**
+  This is the opposite of every other 2-node recipe here, and hy3 is the exception.
+  Plain `auto` (safetensors) pages shards in one at a time, keeping load-time free RAM
+  at a healthy ~28 GiB/node. **`instanttensor` balloons the per-node load-time working
+  set to ~121 GiB and OOM-kills the peer worker** (verified 2026-07-09); **`fastsafetensors`
+  host-buffers shards → NCCL `BROADCAST` timeout / peer wedge** (2026-07-08). Both eugr
+  fast-loaders lose to plain `auto` for a model this size. Load takes ~14 min.
+- **Worker spawn: `VLLM_WORKER_MULTIPROC_METHOD=fork` is required.** Under vLLM's
+  default `spawn`, the headless peer (node_rank 1) worker crashes at startup restoring
+  a semaphore (`synchronize.py __setstate__ → FileNotFoundError` on `/dev/shm/mp-*`),
+  which hangs the head at NCCL rendezvous. `fork` inherits semaphores instead. Same
+  setting the mimo recipe uses. (Verified 2026-07-09.)
+- **Memory/context: GMU 0.80 + fp8 KV → ~112K ctx is the verified config.** GB10 is
+  unified memory (~121 GiB shared) with earlyoom, so the *load-time* footprint is what
+  matters — with the `auto` loader, 0.80 holds ~28 GiB free during load and ~15 GiB at
+  steady state. The forum's `0.90` wedged us; higher GMU buys nothing here since the
+  loader, not GMU, governs the load footprint. `max_model_len` is `114688` (~112K):
+  after the model + MTP drafter (84.5 GiB) load, ~9.4 GiB KV remains → a hard ceiling
+  of **~121,648 tokens**. **Ignore `make hy3-dry` for context sizing — it's optimistic
+  (~165K); 131072 fails the KV-sizing check.** Concurrency at 114688 is ~1.02x.
+- **fp8_e4m3 KV — the checkpoint has no KV calibration scales**, so fp8 KV *can* cause
+  **language drift** (stray Chinese in English). A 2026-07-09 smoke test showed **none**,
+  but spot-check if you depend on it. fp8 is what buys ~112K ctx here (bf16 would cap
+  ~60K at this GMU). Zero-drift fallback: `-o kv_cache_dtype=auto` (bf16) plus a lower
+  `-o max_model_len` (~60K).
 - **Spec decode: `num_speculative_tokens: 1` only.** The layer-80 MTP drafter hits
   62–76% pos-1 acceptance (83% on GSM8K), but pos-2 acceptance is only ~20% on GB10,
   so **spec-2 is a ~30% throughput LOSS.** It is hardcoded to 1 inside the JSON
@@ -185,11 +191,17 @@ runbook below.
 - **CUDA arch pinned to `12.1a`** for GB10 Blackwell (repo convention, build-time).
   NCCL knobs are the homelab's standard IB settings (the forum specified only ray +
   ConnectX-7 MTU 9000). Adjust if cross-node all-reduce misbehaves.
-- **No remote reboot exists on these units** (no BMC/IPMI). If a launch wedges a
-  node, only the physical power button recovers it — which is why the memory-safety
-  settings above are non-negotiable. Run `make hy3-dry` first, and watch free RAM on
-  both nodes during load.
-- **Performance baseline** (forum, 2-Spark cross-node TP=2, 128K ctx): ~21.8 tok/s
-  single stream, ~59.7 tok/s aggregate 6-way concurrent.
+- **No remote reboot exists on these units** (no BMC/IPMI) — a wedged node needs the
+  physical power button. That said, with this config (`auto` loader + `fork`), every
+  failed attempt on 2026-07-09 died **cleanly** — the worker raised an in-process
+  exception, sparkrun tore the containers down, and both nodes recovered fully with no
+  wedge. The nodes have **16 GiB of swap**, and earlyoom's `-s 80` gate means it only
+  SIGKILLs when swap is *also* depleted — so a brief low-MemAvailable dip during load
+  does not by itself wedge the box. (The 2026-07-08 wedge was `fastsafetensors`, now
+  avoided.) Still: watch free RAM on both nodes during load and `sparkrun stop` if it
+  truly floors.
+- **Performance** (2-Spark cross-node TP=2): forum baseline ~21.8 tok/s single stream,
+  ~59.7 tok/s aggregate 6-way. Local 2026-07-09 smoke test: coherent output at
+  ~14.5 tok/s end-to-end on a short single-stream request (incl. prefill).
 - Keep `hy3-295b-nvfp4.env` in sync with the `env:` block in the YAML if you edit
   either.

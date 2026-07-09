@@ -47,29 +47,34 @@ defaults:
   served_model_name: Hy3-295B-NVFP4
   tensor_parallel: 2
   pipeline_parallel: 1
-  # GB10 exposes ~111.4 GiB free of 121.69 GiB. The forum runs 0.90, but 0.90
-  # OOM-killed the peer here (earlyoom + GB10 unified memory) and wedged spark-d306
-  # 2026-07-08. 0.85 is the homelab fleet ceiling (minimax-nvfp4 runs it), leaves
-  # ~18 GiB free RAM at steady state, and is safe *because* instanttensor (below)
-  # removes the load-time memory spike that actually caused the wedge. Don't exceed 0.85.
-  gpu_memory_utilization: 0.85
-  # ~115K is what fits at GMU 0.85 with bf16 KV (~160 KB/tok/GPU, after ~84 GB/GPU of
-  # weights). Confirm with `make hy3-dry`; lower this if the estimator says it won't
-  # fit. Full 128K would need GMU ~0.88 (unsafe here) or fp8 KV (drift risk — see
-  # kv_cache_dtype below), so 0.85 + bf16 caps out around here.
+  # VERIFIED WORKING 2026-07-09 (live serve + inference confirmed). GB10 is unified
+  # memory (~121 GiB shared) with earlyoom. 0.80 keeps ~24 GiB OS headroom during the
+  # weight-load window and ~15 GiB free at steady state (KV allocated). The forum's
+  # 0.90 wedged us; higher GMU is unnecessary here since the load-format (auto) — not
+  # GMU — is what governs the load-time footprint. Keep at 0.80.
+  gpu_memory_utilization: 0.80
+  # VERIFIED: 114688 (~112K) fits at GMU 0.80 + fp8 KV. After the model + MTP drafter
+  # load (84.5 GiB) and profiling, ~9.4 GiB KV remains -> a hard ceiling of ~121,648
+  # tokens (vLLM's own estimate). The dry-run estimator is optimistic (~165K) — ignore
+  # it; 131072 FAILS the KV-sizing check. Concurrency at 114688 is ~1.02x; lower this
+  # for more concurrent-request headroom, raise toward ~120K for a bit more context.
   max_model_len: 114688
   max_num_seqs: 6
   max_num_batched_tokens: 4096
-  # bf16 KV on purpose: this checkpoint ships WITHOUT KV calibration scales, so fp8
-  # KV can cause language drift. Set kv_cache_dtype=fp8 only on a KV-calibrated rev.
-  kv_cache_dtype: auto
-  # Loader for the ~168 GiB of NVFP4 weights. instanttensor (eugr's streaming loader,
-  # used by every other 2-node recipe here) keeps load-time peak memory low. Do NOT use
-  # fastsafetensors on these nodes: it host-buffers shards while filling the unified
-  # weight allocation, spiking free memory to ~500 MiB during load, which earlyoom then
-  # kills -> a rank dies -> NCCL hang -> the peer wedges (needs a power-cycle). Learned
-  # the hard way 2026-07-08. See README.md and [[spark-homelab-ops]].
-  load_format: instanttensor
+  # fp8_e4m3 KV — doubles the context that fits (bf16 would cap ~60K at this GMU). This
+  # checkpoint ships WITHOUT KV calibration scales, so fp8 KV *can* cause language drift
+  # (stray Chinese in English); a 2026-07-09 smoke test showed NONE, but spot-check if
+  # you rely on it. Fallback for zero drift risk: -o kv_cache_dtype=auto (bf16) with a
+  # lower -o max_model_len (~60K fits at GMU 0.80).
+  kv_cache_dtype: fp8_e4m3
+  # Loader for the ~168 GiB of NVFP4 weights. Use `auto` (plain safetensors) — it pages
+  # shards in one at a time, keeping load-time free RAM at a healthy ~28 GiB/node.
+  # Do NOT use instanttensor here: for this 168 GiB model it balloons the per-node
+  # load-time working set to ~121 GiB and OOM-kills the peer worker (verified 2026-07-09,
+  # runs 5-6). And do NOT use fastsafetensors: it host-buffers shards -> NCCL broadcast
+  # timeout / wedge (2026-07-08). Both eugr fast-loaders lose to plain `auto` for hy3.
+  # (This is the opposite of the other 2-node recipes here — hy3 is the exception.)
+  load_format: auto
   # NB: num_speculative_tokens is NOT a default here — it lives inside the JSON
   # --speculative-config blob, and sparkrun (0.2.39) does not substitute {placeholders}
   # nested inside literal `{...}` (greedy brace matching), so it is hardcoded in the
@@ -81,6 +86,13 @@ defaults:
 # convention (build-time) and the NCCL block is the homelab's standard IB tuning
 # (the forum recipe specified ray + CX-7 MTU 9000 but no explicit NCCL knobs).
 env:
+  # Worker spawn method. The headless peer (node_rank 1) worker crashes at startup
+  # under vLLM's default `spawn` with a multiprocessing semaphore restore error
+  # (synchronize.py __setstate__ -> FileNotFoundError on /dev/shm/mp-*), which hangs
+  # the head at NCCL rendezvous. `fork` inherits semaphores instead of re-opening
+  # them, avoiding the failure. Same setting the sibling mimo recipe uses. Found the
+  # hard way 2026-07-09 (runs 6-7).
+  VLLM_WORKER_MULTIPROC_METHOD: fork
   # CUDA arch (GB10 = sm_121a / Blackwell) — repo convention, matters at build time.
   TORCH_CUDA_ARCH_LIST: 12.1a
   FLASHINFER_CUDA_ARCH_LIST: 12.1a
