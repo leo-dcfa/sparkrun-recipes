@@ -1,0 +1,133 @@
+# Recipe: Hy3-295B (Hunyuan 3) NVFP4-W4A16 + MTP for DGX Spark GB10
+# Source: https://forums.developer.nvidia.com/t/hy3-295b-hunyuan-3-nvfp4-w4a16-mtp-speculative-on-2x-dgx-spark-gb10-128k-ctx-21-8-tok-s-single-59-7-tok-s-6-way/375851
+#
+# Tencent Hy3 / Hunyuan 3 (295B total, 21B active MoE, 192 experts top-8, 3.8B MTP
+# layer, 256K native ctx; Apache-2.0, released 2026-07-06), requantized to weight-only
+# NVFP4 (W4A16) as kodelow/Hy3-NVFP4-W4A16 (~181 GB) so it fits across 2x DGX Spark
+# (GB10) at cross-node TP=2. Routed experts are 4-bit E2M1 w/ FP8 group scales; the
+# shared expert, attention, router, dense MLPs, embeddings, lm_head and norms stay
+# BF16. Served on the MARLIN NvFp4 kernel + the layer-80 MTP drafter for spec decode.
+# COMMUNITY / UNVERIFIED on this host — see README.md, especially the fp8-KV language
+# -drift, spec-token-count, and :opensource tool-parser caveats.
+
+recipe_version: "1"
+name: Hy3-295B-NVFP4
+model: kodelow/Hy3-NVFP4-W4A16
+runtime: vllm-distributed
+min_nodes: 2
+
+# Requires two Sparks (1 GB10 each -> tensor_parallel 2). Will not run solo. TP=3 is
+# impossible (8 KV heads don't divide by 3), so this is a 2-Spark (or 4-Spark) recipe.
+cluster_only: true
+
+# eugr/spark-vllm:latest already ships vLLM 0.23.1 (dev790, 2026-07-05) with the HYV3
+# model, the layer-80 MTP module, and the hy_v3 tool/reasoning parsers. Those parsers
+# derive the special-token suffix from tokenizer init_kwargs["token_suffix"], but this
+# checkpoint's tokenizer_config.json does NOT set it, so the parsers fall back to bare
+# <think>/<tool_call> tokens and crash at startup ("could not locate think start/end
+# tokens"). The :hy3-opensource image below is eugr/spark-vllm:latest with a one-line
+# patch defaulting that suffix to ":opensource" (built here via scratchpad/Dockerfile.hy3;
+# not pushed anywhere — sparkrun distributes the local image to both nodes). See
+# README.md, "hy3-295b-nvfp4 — caveats".
+container: eugr/spark-vllm:hy3-opensource
+
+metadata:
+  description: Hy3-295B (Hunyuan 3) NVFP4-W4A16 on 2x DGX Spark GB10, cross-node TP=2 + MTP
+  maintainer: community (kodelow HF quant; NVIDIA developer forums recipe)
+  source: https://forums.developer.nvidia.com/t/hy3-295b-hunyuan-3-nvfp4-w4a16-mtp-speculative-on-2x-dgx-spark-gb10-128k-ctx-21-8-tok-s-single-59-7-tok-s-6-way/375851
+  base_model: tencent/Hy3
+  model_dtype: nvfp4-w4a16
+  quantization: nvfp4-w4a16  # weight-only; MoE experts 4-bit E2M1, rest BF16 (MARLIN NvFp4)
+  vllm_version: "0.23.1"
+
+# Defaults — override on the CLI with -o key=value or the dedicated flags.
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  served_model_name: Hy3-295B-NVFP4
+  tensor_parallel: 2
+  pipeline_parallel: 1
+  # GB10 exposes ~111.4 GiB free of 121.69 GiB. The forum runs 0.90, but 0.90
+  # OOM-killed the peer here (earlyoom + GB10 unified memory) and wedged spark-d306
+  # 2026-07-08. 0.85 is the homelab fleet ceiling (minimax-nvfp4 runs it), leaves
+  # ~18 GiB free RAM at steady state, and is safe *because* instanttensor (below)
+  # removes the load-time memory spike that actually caused the wedge. Don't exceed 0.85.
+  gpu_memory_utilization: 0.85
+  # ~115K is what fits at GMU 0.85 with bf16 KV (~160 KB/tok/GPU, after ~84 GB/GPU of
+  # weights). Confirm with `make hy3-dry`; lower this if the estimator says it won't
+  # fit. Full 128K would need GMU ~0.88 (unsafe here) or fp8 KV (drift risk — see
+  # kv_cache_dtype below), so 0.85 + bf16 caps out around here.
+  max_model_len: 114688
+  max_num_seqs: 6
+  max_num_batched_tokens: 4096
+  # bf16 KV on purpose: this checkpoint ships WITHOUT KV calibration scales, so fp8
+  # KV can cause language drift. Set kv_cache_dtype=fp8 only on a KV-calibrated rev.
+  kv_cache_dtype: auto
+  # Loader for the ~168 GiB of NVFP4 weights. instanttensor (eugr's streaming loader,
+  # used by every other 2-node recipe here) keeps load-time peak memory low. Do NOT use
+  # fastsafetensors on these nodes: it host-buffers shards while filling the unified
+  # weight allocation, spiking free memory to ~500 MiB during load, which earlyoom then
+  # kills -> a rank dies -> NCCL hang -> the peer wedges (needs a power-cycle). Learned
+  # the hard way 2026-07-08. See README.md and [[spark-homelab-ops]].
+  load_format: instanttensor
+  # NB: num_speculative_tokens is NOT a default here — it lives inside the JSON
+  # --speculative-config blob, and sparkrun (0.2.39) does not substitute {placeholders}
+  # nested inside literal `{...}` (greedy brace matching), so it is hardcoded in the
+  # command below. It is pinned to 1 ON PURPOSE: pos-2 MTP acceptance is ~20% on GB10,
+  # so spec-2 is a ~30% LOSS. pos-1 acceptance is 62-76% (83% on GSM8K). Don't raise it.
+
+# Environment variables (kept in sync with hy3-295b-nvfp4.env — see README).
+# The quant author states no env vars are strictly required; the arch pins are repo
+# convention (build-time) and the NCCL block is the homelab's standard IB tuning
+# (the forum recipe specified ray + CX-7 MTU 9000 but no explicit NCCL knobs).
+env:
+  # CUDA arch (GB10 = sm_121a / Blackwell) — repo convention, matters at build time.
+  TORCH_CUDA_ARCH_LIST: 12.1a
+  FLASHINFER_CUDA_ARCH_LIST: 12.1a
+  # NCCL over the ConnectX-7 / InfiniBand-RoCE link between the two Sparks.
+  # NB: the forum recipe did NOT specify NCCL tuning; these are the homelab's
+  # standard IB settings. Adjust if cross-node all-reduce misbehaves.
+  NCCL_NET: IB
+  NCCL_IB_DISABLE: 0
+  NCCL_IB_GID_INDEX: 3
+  NCCL_CROSS_NIC: 1
+  NCCL_CUMEM_ENABLE: 0
+  NCCL_IGNORE_CPU_AFFINITY: 1
+  NCCL_DEBUG: WARN
+
+# Serve command template (forum's 2-Spark NVFP4 recipe).
+#
+# --enforce-eager is load-bearing: FlashInfer's native FP4 path freezes GB10s, so
+# CUDA-graph compilation is disabled. --moe-backend marlin selects the MARLIN NvFp4
+# kernel (the FlashInfer W4A4 backends reject this weight-only scheme).
+#
+# NO --distributed-executor-backend here (and no --nnodes/--node-rank/--master-addr):
+# sparkrun's vllm-distributed runtime injects the native multi-node launch flags
+# (--nnodes N --node-rank R --master-addr/--master-port, one vllm per node) and picks
+# a compatible backend itself. The forum/tonyd2wild recipes pass `ray`, but that is for
+# their HAND-ROLLED ray cluster (ray head+worker, single vllm serve, no --nnodes); vLLM
+# 0.23 REJECTS `ray` together with nnodes>1 ("can only be set when backend is mp, uni or
+# external_launcher"). Matches the @official/@experimental 2-node recipes, which also
+# omit the backend flag.
+command: |
+  vllm serve {model} \
+      --served-model-name {served_model_name} \
+      --host {host} \
+      --port {port} \
+      --trust-remote-code \
+      --tensor-parallel-size {tensor_parallel} \
+      --pipeline-parallel-size {pipeline_parallel} \
+      --moe-backend marlin \
+      --enforce-eager \
+      --load-format {load_format} \
+      --dtype auto \
+      --max-model-len {max_model_len} \
+      --max-num-seqs {max_num_seqs} \
+      --max-num-batched-tokens {max_num_batched_tokens} \
+      --kv-cache-dtype {kv_cache_dtype} \
+      --gpu-memory-utilization {gpu_memory_utilization} \
+      --speculative-config '{"method":"mtp","num_speculative_tokens":1}' \
+      --enable-prefix-caching \
+      --enable-auto-tool-choice \
+      --tool-call-parser hy_v3 \
+      --reasoning-parser hy_v3

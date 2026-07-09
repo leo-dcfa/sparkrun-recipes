@@ -1,0 +1,18 @@
+# Builds eugr/spark-vllm:hy3-opensource — the container the hy3-295b-nvfp4 recipe runs.
+#
+# Base already ships everything hy3 needs (vLLM 0.23.1 dev790 + the HYV3 model + the
+# layer-80 MTP module + the hy_v3 tool/reasoning parsers). The ONLY change is a one-line
+# patch defaulting the parser token_suffix to ":opensource" so the parsers don't crash
+# on this checkpoint (see docker/patch-hy3-parsers.py for the why).
+#
+# Build (run on each Spark, or build on the head node and let sparkrun distribute it):
+#   docker build -f docker/Dockerfile.hy3 -t eugr/spark-vllm:hy3-opensource docker/
+# or just: docker/build-hy3.sh
+#
+# This image is intentionally NOT pushed to any registry; sparkrun copies the local
+# image to both nodes at launch. If the build fails in the patch step, the parser
+# source has drifted from the assumed shape — see README runbook step B.
+FROM eugr/spark-vllm:latest
+
+COPY patch-hy3-parsers.py /tmp/patch-hy3-parsers.py
+RUN python3 /tmp/patch-hy3-parsers.py && rm -f /tmp/patch-hy3-parsers.py
