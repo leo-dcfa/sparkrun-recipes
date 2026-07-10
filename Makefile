@@ -6,6 +6,7 @@
 #   make m3                               # launch MiniMax-M3 v0 NVFP4 REAP-25 (experimental, sglang)
 #   make qwen                             # launch Qwen3.6-27B FP8+MTP (official)
 #   make hy3                              # launch Hy3-295B NVFP4-W4A16 + MTP (local)
+#   make deepseek-dspark                  # launch DeepSeek-V4-Flash + DSpark drafter (local)
 #   make deepseek MAX_MODEL_LEN=1000000   # override context length
 #   make deepseek-dry                     # VRAM/fit estimate, no launch
 #   make stop                             # stop everything on the cluster
@@ -26,8 +27,11 @@ M3_RECIPE             := @experimental/minimax-m3-v0-nvfp4-2x-reap25
 # Single-node / TP1 recipe.
 QWEN_RECIPE           := @official/qwen3.6-27b-fp8-mtp-vllm
 
-# Local recipe (this repo) — runs by file path, no registry needed.
+# Local recipes (this repo) — run by file path, no registry needed.
 HY3_RECIPE            := recipes/hy3-295b-nvfp4.yaml
+# DeepSeek-V4-Flash + DSpark drafter (eugr's vllm-node image). Distinct from the
+# published DEEPSEEK_RECIPE above (which is fp8 + MTP). fp8 KV, cross-node TP2.
+DEEPSEEK_DSPARK_RECIPE := recipes/deepseek-v4-flash-dspark.yaml
 
 # Optional overrides — set on the command line, e.g.
 #   make deepseek MAX_MODEL_LEN=1000000 GPU_MEM=0.85
@@ -45,9 +49,9 @@ endif
 
 RUN := $(SPARKRUN) run --cluster $(CLUSTER)
 
-.PHONY: help deepseek minimax m3 qwen hy3 \
-        deepseek-dry minimax-dry m3-dry qwen-dry hy3-dry \
-        stop stop-deepseek stop-minimax stop-m3 stop-qwen stop-hy3 \
+.PHONY: help deepseek minimax m3 qwen hy3 deepseek-dspark \
+        deepseek-dry minimax-dry m3-dry qwen-dry hy3-dry deepseek-dspark-dry \
+        stop stop-deepseek stop-minimax stop-m3 stop-qwen stop-hy3 stop-deepseek-dspark \
         status logs list
 
 help: ## Show this help
@@ -71,6 +75,9 @@ qwen: ## Launch Qwen3.6-27B FP8+MTP (official, 1-node)
 hy3: ## Launch Hy3-295B NVFP4-W4A16 + MTP (local, 2-node)
 	$(RUN) $(HY3_RECIPE) $(OVERRIDES)
 
+deepseek-dspark: ## Launch DeepSeek-V4-Flash + DSpark drafter (local, 2-node, fp8 KV)
+	$(RUN) $(DEEPSEEK_DSPARK_RECIPE) $(OVERRIDES)
+
 ## --- dry-run / VRAM fit estimate (no launch) ------------------------------
 
 deepseek-dry: ## Estimate VRAM/context fit for DeepSeek
@@ -87,6 +94,9 @@ qwen-dry: ## Estimate VRAM/context fit for Qwen3.6-27B FP8+MTP
 
 hy3-dry: ## Estimate VRAM/context fit for Hy3-295B NVFP4-W4A16
 	$(RUN) $(HY3_RECIPE) $(OVERRIDES) --dry-run
+
+deepseek-dspark-dry: ## Estimate VRAM/context fit for DeepSeek-V4-Flash + DSpark
+	$(RUN) $(DEEPSEEK_DSPARK_RECIPE) $(OVERRIDES) --dry-run
 
 ## --- lifecycle ------------------------------------------------------------
 
@@ -107,6 +117,9 @@ stop-qwen: ## Stop just the Qwen3.6-27B FP8+MTP workload
 
 stop-hy3: ## Stop just the Hy3-295B NVFP4 workload
 	$(SPARKRUN) stop $(HY3_RECIPE) --cluster $(CLUSTER)
+
+stop-deepseek-dspark: ## Stop just the DeepSeek-V4-Flash + DSpark workload
+	$(SPARKRUN) stop $(DEEPSEEK_DSPARK_RECIPE) --cluster $(CLUSTER)
 
 status: ## Show running sparkrun containers
 	$(SPARKRUN) status --cluster $(CLUSTER)

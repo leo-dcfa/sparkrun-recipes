@@ -13,6 +13,8 @@ sparkrun-recipes/
     ├── ornith-1.0-397b.env          # standalone env file (mirrors the recipe env: block)
     ├── hy3-295b-nvfp4.yaml          # Hy3-295B (Hunyuan 3) NVFP4-W4A16 + MTP recipe
     ├── hy3-295b-nvfp4.env           # standalone env file (mirrors the recipe env: block)
+    ├── deepseek-v4-flash-dspark.yaml # DeepSeek-V4-Flash + DSpark drafter recipe (eugr's repo)
+    ├── deepseek-v4-flash-dspark.env # standalone env file (mirrors the recipe env: block)
     └── mods/                        # recipe mods (empty for now)
 
 docker/
@@ -205,3 +207,65 @@ launches it; the overrides below are only for deviating from it.
   ~14.5 tok/s end-to-end on a short single-stream request (incl. prefill).
 - Keep `hy3-295b-nvfp4.env` in sync with the `env:` block in the YAML if you edit
   either.
+
+## deepseek-v4-flash-dspark — caveats
+
+Community recipe from the NVIDIA developer forums thread
+[Instructions for running DeepSeek-V4-Flash with DSpark using eugr's repo](https://forums.developer.nvidia.com/t/instructions-for-running-deepseek-v4-flash-with-dspark-using-eugrs-repo/376220),
+serving **DeepSeek-V4-Flash** (`deepseek-ai/DeepSeek-V4-Flash-DSpark`, the DSpark-enabled
+checkpoint) across both Sparks with the **DSpark** speculative-decoding drafter. It is
+**unverified on this host**. `make deepseek-dspark` launches it; `make deepseek-dspark-dry`
+estimates fit first.
+
+> **Not the same as `make deepseek`.** `make deepseek` runs the published
+> `@experimental/deepseek4-flash-fp8-mtp-vllm` (fp8 + **MTP** drafter). This recipe is
+> the separate **DSpark**-drafter variant from eugr's repo, kept as a local YAML.
+
+- **2 Sparks required** (`cluster_only`, `min_nodes: 2`). Cross-node
+  `tensor_parallel: 2`, one GB10 per node. It cannot run solo.
+- **The container is a *locally built* image, not a published tag.** The recipe points
+  at bare **`vllm-node`**, which is what eugr's
+  [`spark-vllm-docker`](https://github.com/eugr/spark-vllm-docker) build produces. Build
+  it with the FlashInfer PR applied and put it on **both** nodes:
+  ```bash
+  ./build-and-copy.sh --apply-flashinfer-pr 3817     # build vllm-node + FlashInfer PR 3817
+  docker save vllm-node -o /tmp/vllm-node-patched.tar # export
+  rsync -avP /tmp/vllm-node-patched.tar <user>@<spark2>:/tmp/
+  # on the second Spark:
+  docker load -i /tmp/vllm-node-patched.tar
+  ```
+  (Or let sparkrun distribute the locally-built image to both nodes.)
+- **`--load-format safetensors` is required.** The forum note is explicit: the model
+  **crashes** with any other load-format. Do **not** switch to `instanttensor` /
+  `fastsafetensors` here (this is the opposite of the mid-size 2-node recipes).
+- **fp8 KV + block-size 256 + 256K context.** `kv_cache_dtype: fp8`,
+  `block_size: 256`, `max_model_len: 262144`. The 256K default is the forum's and is
+  **unverified on this host** — run `make deepseek-dspark-dry` first and lower
+  `max_model_len` if the KV-sizing check fails.
+- **GMU 0.8** — at/under the homelab `0.85` ceiling, safe on these unified-memory
+  nodes. Don't push higher (earlyoom SIGKILLs the worker if the load-time page-cache
+  spike drops free RAM under threshold).
+- **DSpark spec decode: `num_speculative_tokens: 5`.** It lives inside the literal JSON
+  `--speculative-config '{"method":"dspark","num_speculative_tokens":5}'` blob, along
+  with `--hf-overrides '{"dspark_noise_token_id":128799}'` — sparkrun (0.2.39) doesn't
+  substitute `{placeholders}` nested in literal braces, so both are **hardcoded** in the
+  `command:`. Forum-reported: **27.65%** acceptance rate, **2.38** mean acceptance length.
+- **DeepSeek-V4 tokenizer/parsers.** `--tokenizer-mode deepseek_v4`,
+  `--tool-call-parser deepseek_v4`, `--reasoning-parser deepseek_v4`, plus
+  `--default-chat-template-kwargs.thinking=true` / `.reasoning_effort=high`. These are
+  reproduced verbatim from the forum recipe (the `--reasoning-config` restating the
+  parser name is redundant but kept as-published).
+- **Gated model → set `HF_TOKEN`.** The env block ships `HF_TOKEN=ADD_YOUR_TOKEN_HERE`
+  as a placeholder — replace it (in both the YAML `env:` and the `.env`) or export
+  `HF_TOKEN` before launch.
+- **No `--distributed-executor-backend ray`.** The forum command ends with `ray`, but
+  that is for its hand-rolled ray cluster (single `vllm serve`, no `--nnodes`).
+  sparkrun's `vllm-distributed` runtime injects vLLM's native multi-node flags
+  (`--nnodes N --node-rank R --master-addr/--master-port`, one vllm per node), and vLLM
+  0.23 **rejects `ray` together with `nnodes>1`**. The recipe omits it, matching every
+  other 2-node recipe here.
+- **CUDA arch pinned to `12.1a`** for GB10 Blackwell (repo convention, build-time). The
+  NCCL block is the homelab's standard IB tuning (the forum specified only ray +
+  ConnectX-7 MTU 9000). Adjust if cross-node all-reduce misbehaves.
+- Keep `deepseek-v4-flash-dspark.env` in sync with the `env:` block in the YAML if you
+  edit either.
