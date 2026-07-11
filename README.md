@@ -269,3 +269,50 @@ estimates fit first.
   ConnectX-7 MTU 9000). Adjust if cross-node all-reduce misbehaves.
 - Keep `deepseek-v4-flash-dspark.env` in sync with the `env:` block in the YAML if you
   edit either.
+
+## qwen3.6-35b-a3b-nvfp4-fast — caveats
+
+Unsloth's Spark-targeted quant of Qwen3.6-35B-A3B (released 2026-07-10), added
+2026-07-12 from the [Unsloth DGX Spark instructions](https://unsloth.ai/docs/models/qwen3.6).
+Launch: `make qwen35` (single node, TP=1); fit-check: `make qwen35-dry`.
+
+- **Status: dry-run validated only.** Both Sparks were serving deepseek-dspark
+  when this was added, so it has not had a live boot on this host yet. First
+  launcher: watch for the two failure modes flagged below (b12x rejection,
+  MTP-draft backend).
+- **`flashinfer_b12x` is load-bearing — and sm_121-specific.** Per Unsloth, GB10
+  must force `--moe-backend/--linear-backend flashinfer_b12x` for this quant or
+  serving silently degrades to Marlin W4A16 (~2.5x slower — that is what the
+  older `@eugr/qwen3.6-35b-a3b-nvfp4` recipe runs on the `nvidia/` checkpoint).
+  This is the **opposite** of the sm_120 (RTX 5090) rule, where forcing a MoE
+  backend is what causes the 2.5x loss. `eugr/spark-vllm:latest` (vLLM 0.23.1
+  dev790) passes Unsloth's b12x preflight on both nodes (verified 2026-07-12);
+  the preflight command is in the recipe header.
+- **1M context via static YaRN.** Default `max_model_len` is 1,010,000 using the
+  Qwen model card's exact `--hf-overrides` rope blob (factor 4.0) +
+  `VLLM_ALLOW_LONG_MAX_MODEL_LEN=1`. Memory is comfortable on one GB10
+  (~22 GiB weights + ~10 GiB KV at 1M; KV is cheap — 10/40 full-attn layers,
+  2 KV heads). **Trade-off:** static YaRN slightly degrades short-context
+  quality (Qwen's own warning — the scale applies at every length). For mostly
+  ≤256K work, drop the `--hf-overrides` line and `-o max_model_len=262144`; for
+  ~512K, set `"factor": 2.0` in the blob.
+- **fp8 KV is calibrated here** — unlike hy3, this checkpoint ships KV scales,
+  so the language-drift risk of uncalibrated fp8 KV does not apply. Keep
+  `kv_cache_dtype: fp8`.
+- **MTP spec decode: K=2** (Unsloth's recommendation; their fixed MTP head).
+  Unverified acceptance on GB10 for this quant — the same model's pos-2
+  acceptance measured ~0.72 on the 5090 box. If the b12x MoE backend rejects
+  the draft module at startup, add `"moe_backend":"triton"` inside the
+  `--speculative-config` JSON (eugr's trick on the Marlin recipe). If accepted
+  throughput looks bad, drop to `"num_speculative_tokens":1` (hy3 lesson: on
+  GB10, pos-2 acceptance can make K=2 a net loss).
+- **No chat-template mod needed.** Unsloth checkpoints ship a fixed chat
+  template + fixed MTP head — do not apply `mods/fix-qwen3.6-chat-template`
+  (that mod exists for the `Qwen/` originals).
+- **Higher-precision alternatives on this hardware** (all fit on one GB10, all
+  bandwidth-bound so roughly proportional decode cost): `Qwen/Qwen3.6-35B-A3B-FP8`
+  (~37 GiB, ~2x the active-weight reads → existing
+  `@official/qwen3.6-35b-a3b-fp8-mtp-vllm` / `@eugr/qwen3.6-35b-a3b-fp8`
+  recipes, also 1M-capable with the same YaRN blob) and BF16 (~70 GiB, ~4x
+  reads). This NVFP4-Fast recipe is the speed end of that curve; the FP8
+  official recipes are the quality end.

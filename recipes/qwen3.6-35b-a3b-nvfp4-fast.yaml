@@ -1,0 +1,121 @@
+# Recipe: Qwen3.6-35B-A3B NVFP4-Fast (Unsloth) + MTP, 1M ctx via YaRN — single GB10
+# Source: https://unsloth.ai/docs/models/qwen3.6 (DGX Spark section)
+# Model:  https://huggingface.co/unsloth/Qwen3.6-35B-A3B-NVFP4-Fast (released 2026-07-10)
+#
+# Unsloth's Spark-targeted quant of Qwen3.6-35B-A3B (35B total / ~3B active MoE,
+# 256 experts; hybrid GDN: only 10/40 layers full attention). compressed-tensors
+# mixed: MoE experts NVFP4 (W4A4), attention FP8, embeddings/norms BF16 — ~21.8 GB
+# on disk. Calibrated for fp8 KV cache; ships Unsloth's FIXED MTP draft head and a
+# fixed chat template (so eugr's fix-qwen3.6-chat-template mod is NOT needed here).
+#
+# This replaces the Marlin path of @eugr/qwen3.6-35b-a3b-nvfp4 (nvidia/ checkpoint,
+# weight-only W4A16): per the Unsloth page, GB10 (sm_121a) must serve this quant on
+# the flashinfer_b12x MoE + linear backends or it degrades back to marlin W4A16
+# (~2.5x slower). NOTE this is the OPPOSITE rule from sm_120 (RTX 5090), where you
+# must NOT force a MoE backend. Verified 2026-07-12 that the container below passes
+# Unsloth's preflight on this host:
+#   python3 -c "import torch; from vllm.utils.flashinfer import \
+#     has_flashinfer_b12x_gemm as g, has_flashinfer_b12x_moe as m; \
+#     assert torch.cuda.get_device_capability()[0]==12 and g() and m()"
+#
+# 1M CONTEXT: native max is 262,144; the command below extends to 1,010,000 via
+# static YaRN (factor 4.0), the exact --hf-overrides blob from the Qwen model card.
+# Memory is a non-issue on one GB10: KV/token = 10 full-attn layers x 2(K+V) x
+# 2 kv-heads x 256 head-dim x 1B (fp8) = 10 KiB -> ~9.9 GiB at 1.01M, + ~22 GiB
+# weights, against ~97 GiB budget at GMU 0.80. CAVEAT: static YaRN slightly hurts
+# SHORT-context quality (scaling is applied regardless of input length — Qwen's own
+# warning). For a native-context serve, drop the --hf-overrides line and set
+# -o max_model_len=262144; for ~512K use factor 2.0 in the blob instead.
+# UNVERIFIED live on this host so far: validated via --dry-run only (both Sparks
+# were busy with deepseek-dspark when added). Expected same-class decode as the
+# NVIDIA B200 numbers Unsloth quotes only directionally — GB10 is ~273 GB/s.
+
+recipe_version: "1"
+name: Qwen3.6-35B-A3B-NVFP4-Fast
+model: unsloth/Qwen3.6-35B-A3B-NVFP4-Fast
+
+# Single GB10 is plenty (see math above) — default TP=1, no cluster requirement.
+# Runs fine while the other node serves something else. --tp 2 works if you want
+# both Sparks on it (NCCL env below is the homelab's standard IB tuning).
+
+container: eugr/spark-vllm:latest
+
+metadata:
+  description: Qwen3.6-35B-A3B (Unsloth NVFP4-Fast) + MTP on 1x GB10, 1M ctx via YaRN, flashinfer_b12x
+  maintainer: unsloth quant; recipe local (Leo), from the Unsloth DGX Spark instructions
+  source: https://unsloth.ai/docs/models/qwen3.6
+  base_model: Qwen/Qwen3.6-35B-A3B
+  model_dtype: nvfp4-w4a4-fp8-mixed
+  quantization: compressed-tensors (MoE NVFP4 W4A4, attn FP8, fp8-KV calibrated)
+  vllm_version: "0.23.1 (>= dev790; needs flashinfer b12x helpers)"
+
+# Defaults — override on the CLI with -o key=value or the dedicated flags.
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  served_model_name: qwen3.6-35b-a3b
+  tensor_parallel: 1
+  # Homelab unified-memory convention (see hy3): 0.80 keeps OS headroom on the
+  # 121 GiB GB10. At 1M ctx this recipe only needs ~35 GiB anyway.
+  gpu_memory_utilization: 0.80
+  # 1,010,000 = the Qwen model card's YaRN-extended max (factor 4.0). Requires the
+  # --hf-overrides blob in the command + VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 (env).
+  max_model_len: 1010000
+  max_num_seqs: 4
+  # Bounds the chunked-prefill/profiling pass — load-bearing on hybrid GDN/SSM
+  # models (same lesson as the 27B on the 5090 box; eugr's 35B recipes use it too).
+  max_num_batched_tokens: 8192
+  # The Unsloth quant is explicitly calibrated for fp8 KV — keep it.
+  kv_cache_dtype: fp8
+  # ~22 GiB of shards; fastsafetensors is fine at this size (hy3's load_format
+  # trouble was specific to its 168 GiB + cross-node broadcast).
+  load_format: fastsafetensors
+
+# Environment variables (kept in sync with qwen3.6-35b-a3b-nvfp4-fast.env).
+env:
+  # Unsloth Spark instruction: target the cute-DSL kernels at GB10 (sm_121a).
+  CUTE_DSL_ARCH: sm_121a
+  # Allow max_model_len beyond the checkpoint's native 262144 (YaRN-extended).
+  VLLM_ALLOW_LONG_MAX_MODEL_LEN: 1
+  # CUDA arch (GB10 = sm_121a / Blackwell) — repo convention, matters at build time.
+  TORCH_CUDA_ARCH_LIST: 12.1a
+  FLASHINFER_CUDA_ARCH_LIST: 12.1a
+  # Worker spawn method — same crash-avoidance as the mimo/hy3 recipes (only
+  # bites at TP=2, harmless at TP=1).
+  VLLM_WORKER_MULTIPROC_METHOD: fork
+  # NCCL over the ConnectX-7 IB link — only exercised if you run --tp 2.
+  NCCL_NET: IB
+  NCCL_IB_DISABLE: 0
+  NCCL_IB_GID_INDEX: 3
+  NCCL_CROSS_NIC: 1
+  NCCL_CUMEM_ENABLE: 0
+  NCCL_IGNORE_CPU_AFFINITY: 1
+  NCCL_DEBUG: WARN
+
+# Serve command. The --hf-overrides and --speculative-config JSON blobs are
+# hardcoded (no {placeholders} inside literal {...} — sparkrun 0.2.x brace
+# matching, same gotcha as hy3). The YaRN blob is verbatim from the Qwen card.
+# MTP num_speculative_tokens=2 is the Unsloth recommendation for this model;
+# if the b12x MoE backend rejects the draft module at startup, add
+# "moe_backend":"triton" inside the speculative-config JSON (eugr's trick).
+command: |
+  vllm serve {model} \
+      --served-model-name {served_model_name} \
+      --host {host} \
+      --port {port} \
+      --tensor-parallel-size {tensor_parallel} \
+      --trust-remote-code \
+      --moe-backend flashinfer_b12x \
+      --linear-backend flashinfer_b12x \
+      --load-format {load_format} \
+      --max-model-len {max_model_len} \
+      --max-num-seqs {max_num_seqs} \
+      --max-num-batched-tokens {max_num_batched_tokens} \
+      --kv-cache-dtype {kv_cache_dtype} \
+      --gpu-memory-utilization {gpu_memory_utilization} \
+      --hf-overrides '{"text_config": {"rope_parameters": {"mrope_interleaved": true, "mrope_section": [11, 11, 10], "rope_type": "yarn", "rope_theta": 10000000, "partial_rotary_factor": 0.25, "factor": 4.0, "original_max_position_embeddings": 262144}}}' \
+      --speculative-config '{"method":"mtp","num_speculative_tokens":2}' \
+      --enable-prefix-caching \
+      --enable-auto-tool-choice \
+      --tool-call-parser qwen3_xml \
+      --reasoning-parser qwen3

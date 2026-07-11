@@ -73,8 +73,9 @@ env:
   DG_JIT_USE_NVRTC: "0"
   VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
   VLLM_USE_BREAKABLE_CUDAGRAPH: "0"
-  # Gated model — replace with your real token (or export HF_TOKEN before launch).
-  HF_TOKEN: "ADD_YOUR_TOKEN_HERE"
+  # Gated model — interpolated from the launching shell's HF_TOKEN (export it, or
+  # let it fall through from ~/.cache/huggingface/token). Never hardcode the secret here.
+  HF_TOKEN: "${HF_TOKEN}"
   # --- Homelab additions (not from the forum) ---
   # Headless peer (node_rank 1) worker crashes under vLLM's default `spawn` restoring
   # a multiprocessing semaphore (synchronize.py __setstate__ -> FileNotFoundError on

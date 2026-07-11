@@ -5,6 +5,7 @@
 #   make minimax                          # launch MiniMax-M2.7 NVFP4 (official)
 #   make m3                               # launch MiniMax-M3 v0 NVFP4 REAP-25 (experimental, sglang)
 #   make qwen                             # launch Qwen3.6-27B FP8+MTP (official)
+#   make qwen35                           # launch Qwen3.6-35B-A3B NVFP4-Fast + MTP, 1M ctx (local)
 #   make hy3                              # launch Hy3-295B NVFP4-W4A16 + MTP (local)
 #   make deepseek-dspark                  # launch DeepSeek-V4-Flash + DSpark drafter (local)
 #   make deepseek MAX_MODEL_LEN=1000000   # override context length
@@ -26,6 +27,9 @@ M3_RECIPE             := @experimental/minimax-m3-v0-nvfp4-2x-reap25
 # Qwen3.6-27B FP8 with multi-token prediction (MTP) for faster decode.
 # Single-node / TP1 recipe.
 QWEN_RECIPE           := @official/qwen3.6-27b-fp8-mtp-vllm
+# Qwen3.6-35B-A3B Unsloth NVFP4-Fast: flashinfer_b12x kernels + MTP, 1M ctx via
+# YaRN. Single-node / TP1 local recipe — dry-run validated only, see README.
+QWEN35_RECIPE         := recipes/qwen3.6-35b-a3b-nvfp4-fast.yaml
 
 # Local recipes (this repo) — run by file path, no registry needed.
 HY3_RECIPE            := recipes/hy3-295b-nvfp4.yaml
@@ -49,9 +53,9 @@ endif
 
 RUN := $(SPARKRUN) run --cluster $(CLUSTER)
 
-.PHONY: help deepseek minimax m3 qwen hy3 deepseek-dspark \
-        deepseek-dry minimax-dry m3-dry qwen-dry hy3-dry deepseek-dspark-dry \
-        stop stop-deepseek stop-minimax stop-m3 stop-qwen stop-hy3 stop-deepseek-dspark \
+.PHONY: help deepseek minimax m3 qwen qwen35 hy3 deepseek-dspark \
+        deepseek-dry minimax-dry m3-dry qwen-dry qwen35-dry hy3-dry deepseek-dspark-dry \
+        stop stop-deepseek stop-minimax stop-m3 stop-qwen stop-qwen35 stop-hy3 stop-deepseek-dspark \
         status logs list
 
 help: ## Show this help
@@ -72,6 +76,9 @@ m3: ## Launch MiniMax-M3 v0 NVFP4 REAP-25 (experimental, sglang, 2-node)
 qwen: ## Launch Qwen3.6-27B FP8+MTP (official, 1-node)
 	$(RUN) $(QWEN_RECIPE) $(OVERRIDES)
 
+qwen35: ## Launch Qwen3.6-35B-A3B NVFP4-Fast + MTP, 1M ctx (local, 1-node)
+	$(RUN) $(QWEN35_RECIPE) $(OVERRIDES)
+
 hy3: ## Launch Hy3-295B NVFP4-W4A16 + MTP (local, 2-node)
 	$(RUN) $(HY3_RECIPE) $(OVERRIDES)
 
@@ -91,6 +98,9 @@ m3-dry: ## Estimate VRAM/context fit for MiniMax-M3 v0 NVFP4 REAP-25
 
 qwen-dry: ## Estimate VRAM/context fit for Qwen3.6-27B FP8+MTP
 	$(RUN) $(QWEN_RECIPE) $(OVERRIDES) --dry-run
+
+qwen35-dry: ## Estimate VRAM/context fit for Qwen3.6-35B-A3B NVFP4-Fast
+	$(RUN) $(QWEN35_RECIPE) $(OVERRIDES) --dry-run
 
 hy3-dry: ## Estimate VRAM/context fit for Hy3-295B NVFP4-W4A16
 	$(RUN) $(HY3_RECIPE) $(OVERRIDES) --dry-run
@@ -114,6 +124,9 @@ stop-m3: ## Stop just the MiniMax-M3 v0 NVFP4 REAP-25 workload
 
 stop-qwen: ## Stop just the Qwen3.6-27B FP8+MTP workload
 	$(SPARKRUN) stop $(QWEN_RECIPE) --cluster $(CLUSTER)
+
+stop-qwen35: ## Stop just the Qwen3.6-35B-A3B NVFP4-Fast workload
+	$(SPARKRUN) stop $(QWEN35_RECIPE) --cluster $(CLUSTER)
 
 stop-hy3: ## Stop just the Hy3-295B NVFP4 workload
 	$(SPARKRUN) stop $(HY3_RECIPE) --cluster $(CLUSTER)
