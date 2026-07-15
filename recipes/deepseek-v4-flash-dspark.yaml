@@ -1,82 +1,139 @@
 # Recipe: DeepSeek-V4-Flash (DSpark drafter) for DGX Spark GB10, 2 nodes
-# Source: https://forums.developer.nvidia.com/t/instructions-for-running-deepseek-v4-flash-with-dspark-using-eugrs-repo/376220
+# Source: https://github.com/tonyd2wild/DeepSeek-v4-Flash-DSpark-1M-NVFP4-KV-2x-DGX-Spark
 #
 # DeepSeek-V4-Flash served across 2x DGX Spark (GB10) at cross-node TP=2 with the
-# **DSpark** speculative-decoding drafter (deepseek-ai/DeepSeek-V4-Flash-DSpark, the
-# DSpark-enabled checkpoint). fp8 KV cache, 256K context, prefix caching. Uses eugr's
-# `vllm-node` image built from eugr/spark-vllm-docker, patched with FlashInfer PR 3817.
+# **DSpark** speculative-decoding drafter and the experimental **`nvfp4_ds_mla`** KV
+# cache — 1M-token context, prefix caching, async scheduling. Uses tonyd2wild's
+# locally-built `vllm-dspark-runtime:dspark-nvfp4-stage-c` image (Stage A->B->C NVFP4
+# build over Rafael Caricio's DSpark vLLM integration).
+#
 # COMMUNITY / UNVERIFIED on this host. See README.md ("deepseek-v4-flash-dspark —
-# caveats") — in particular the locally-built container, the safetensors load-format
-# requirement, and the dropped `ray` backend.
+# caveats") — in particular the locally-built 3-stage container, the checkpoint
+# ambiguity, and the conservative 1M profile chosen here.
 #
 # NB: this is DISTINCT from `make deepseek` (@experimental/deepseek4-flash-fp8-mtp-vllm),
-# the published fp8+MTP recipe. This one is the DSpark-drafter variant from eugr's repo.
+# the published fp8+MTP recipe. This one is the DSpark-drafter + NVFP4-KV variant.
+#
+# Replaces the previous eugr/forum fp8-KV 256K version of this recipe (2026-07-15).
 
 recipe_version: "1"
 name: DeepSeek-V4-Flash-DSpark
-model: deepseek-ai/DeepSeek-V4-Flash-DSpark
+# Upstream's compose/.env DEFAULT is `deepseek-ai/DeepSeek-V4-Flash-DSpark`, but its
+# README "Weights" section and EVERY verified deployment log load
+# `fraserprice/DeepSeek-V4-Flash-DSpark` (HF tags it as a quant of
+# deepseek-ai/DeepSeek-V4-Flash). The nvfp4_ds_mla KV path was validated against
+# fraserprice's checkpoint, so that is what we pin. See README.
+model: fraserprice/DeepSeek-V4-Flash-DSpark
 runtime: vllm-distributed
 min_nodes: 2
 
 # Requires two Sparks (1 GB10 each -> tensor_parallel 2). Will not run solo.
 cluster_only: true
 
-# eugr's `vllm-node` image, built from https://github.com/eugr/spark-vllm-docker
-# with the FlashInfer PR applied:
-#     ./build-and-copy.sh --apply-flashinfer-pr 3817
-# then exported and loaded on BOTH Sparks (docker save -> rsync -> docker load), OR
-# let sparkrun distribute the locally-built image to both nodes. The bare `vllm-node`
-# tag is what that build produces; retag/push if you prefer a registry. See README.
-container: vllm-node
+# tonyd2wild's Stage C NVFP4 runtime — a LOCALLY BUILT image, not a published tag.
+# Build on the head (it rsyncs + rebuilds on the worker by default):
+#     ./build-dspark-vllm-runtime.sh
+# which produces the base DSpark overlay (vllm-dspark-runtime:mia-raf-pr1) then NVFP4
+# stages A -> B -> C. Must exist on BOTH Sparks. A fresh Stage C build already contains
+# Patch 3 (commit e83606a), so the compose bind-mount of dspark_proposer.py is NOT
+# needed here — which matters, because a sparkrun recipe cannot mount that overlay.
+# See README.
+container: vllm-dspark-runtime:dspark-nvfp4-stage-c
 
 metadata:
-  description: DeepSeek-V4-Flash + DSpark drafter on 2x DGX Spark GB10, cross-node TP=2, fp8 KV, 256K ctx
-  maintainer: community (eugr/spark-vllm-docker; NVIDIA developer forums recipe)
-  source: https://forums.developer.nvidia.com/t/instructions-for-running-deepseek-v4-flash-with-dspark-using-eugrs-repo/376220
+  description: DeepSeek-V4-Flash + DSpark drafter on 2x DGX Spark GB10, cross-node TP=2, nvfp4_ds_mla KV, 1M ctx
+  maintainer: community (tonyd2wild/DeepSeek-v4-Flash-DSpark-1M-NVFP4-KV-2x-DGX-Spark)
+  source: https://github.com/tonyd2wild/DeepSeek-v4-Flash-DSpark-1M-NVFP4-KV-2x-DGX-Spark
   base_model: deepseek-ai/DeepSeek-V4-Flash
   draft_method: dspark
-  vllm_version: "0.23"  # eugr vllm-node nightly with the `dspark` spec method + deepseek_v4 parsers
+  kv_cache: nvfp4_ds_mla
+  vllm_version: "0.23"  # Stage C image: dspark spec method + deepseek_v4 parsers + nvfp4_ds_mla
 
 # Defaults — override on the CLI with -o key=value or the dedicated flags.
 defaults:
   port: 8000
   host: 0.0.0.0
-  served_model_name: DeepSeek-V4-Flash-DSpark
+  served_model_name: deepseek-v4-flash-dspark
   tensor_parallel: 2
   pipeline_parallel: 1
-  # 0.8 (forum value) is at/under the homelab's ~0.85 GMU ceiling — safe on these
-  # unified-memory nodes. Do not push higher; earlyoom SIGKILLs the worker if the
-  # load-time page-cache spike drops free RAM under threshold. See README.
-  gpu_memory_utilization: 0.8
-  # 262144 (256K) is the forum default and is UNVERIFIED on this host. Run
-  # `make deepseek-dspark-dry` first — if the KV-sizing check fails, lower it
-  # (fp8 KV + block-size 256 are what stretch context this far).
-  max_model_len: 262144
+  # --- Conservative 1M lane (upstream's "prior agent lane", and the profile of the
+  # 2026-07-04 verified deployment). Upstream's own .env.dspark.example RECOMMENDS the
+  # hotter max_num_seqs=12 / GMU=0.85, but 0.85 sits exactly at this homelab's earlyoom
+  # ceiling, so we take the validated conservative lane instead. See README.
+  gpu_memory_utilization: 0.80
+  # 1048576 (1M) is the model's TRUE YaRN ceiling (original_max_position_embeddings
+  # 65536 x factor 16). Upstream benchmarks 1.5M via VLLM_ALLOW_LONG_MAX_MODEL_LEN, but
+  # that extrapolates past calibration and coherence is NOT guaranteed. Don't raise it.
+  max_model_len: 1048576
   block_size: 256
-  max_num_seqs: 4
+  max_num_seqs: 6
   max_num_batched_tokens: 8192
-  kv_cache_dtype: fp8
-  # safetensors is REQUIRED — the forum note says the model crashes with any other
-  # load-format. Do NOT switch to instanttensor/fastsafetensors here.
-  load_format: safetensors
-  # NB: num_speculative_tokens (5), dspark_noise_token_id (128799), and the reasoning
-  # parser name are NOT substitutable defaults — they live inside literal JSON `{...}`
-  # blobs in the command below, and sparkrun (0.2.39) does not substitute {placeholders}
-  # nested inside literal braces (greedy brace matching). They are hardcoded there.
+  # MUST equal max_num_seqs * (num_speculative_tokens + 1) = 6 * (3 + 1) = 24.
+  # Upstream computes this in shell ($(( MAX_NUM_SEQS * (MTP_NUM_TOKENS + 1) ))); sparkrun
+  # has no arithmetic in templates, so it is a literal here. If you change max_num_seqs
+  # or the spec-token count, RECOMPUTE this — capture size == batch is part of the
+  # 2026-07-03 garble fix.
+  max_cudagraph_capture_size: 24
+  # Experimental NVFP4 KV cache for DeepSeek-V4 sparse MLA — exists ONLY in the Stage C
+  # image. This is the whole point of the upstream recipe (it is what buys 1M ctx).
+  kv_cache_dtype: nvfp4_ds_mla
+  # NB: no load_format. The old forum recipe forced `safetensors`; this recipe does not
+  # set --load-format at all (vLLM default `auto`), matching upstream and the hy3
+  # convention for large checkpoints.
+  #
+  # NB: num_speculative_tokens (3) and draft_sample_method (probabilistic) are NOT
+  # substitutable defaults — they live inside a literal JSON `{...}` blob in the command
+  # below, and sparkrun (0.2.39) does not substitute {placeholders} nested inside literal
+  # braces (greedy brace matching). Same for the thinking/reasoning JSON blobs.
 
 # Environment variables (kept in sync with deepseek-v4-flash-dspark.env — see README).
-# The DG_/VLLM_ vars are the forum recipe's. The arch pins, the `fork` spawn method,
-# and the NCCL block are homelab additions (the forum used a hand-rolled ray cluster
-# with CX-7 MTU 9000 but no explicit NCCL knobs) — the same convention hy3/mimo follow.
+# Values mirror upstream's docker-compose.dspark.yml / .env.dspark.example defaults.
+# The `fork` spawn method and NCCL_IB_GID_INDEX=3 are homelab additions/overrides.
 env:
-  # --- Forum recipe env ---
-  DG_JIT_USE_NVRTC: "0"
+  # --- DSpark garble fix (2026-07-03) — FlashInfer sampler is part of it ---
+  VLLM_USE_FLASHINFER_SAMPLER: "1"
+  # --- Long-context crash fix: clamp stale DSpark draft-KV slot ids (1 = clamp) ---
+  DSPARK_SLOT_CLAMP: "1"
+  # --- B12X MoE: CRITICAL for speed. =1 gives the b12x Mxfp4 MoE backend (~50-60 tok/s);
+  # =0 silently falls back to DEEPGEMM_MXFP4 and tanks decode to ~29 tok/s. Keep 1.
+  # Do NOT add VLLM_USE_B12X_FP8_GEMM=1 — DeepGEMM layout assert during drafter warmup.
+  VLLM_USE_B12X_MOE: "1"
+  VLLM_USE_B12X_WO_PROJECTION: "1"
+  VLLM_B12X_W4A16_FORCE_BLOCKS_PER_SM: "0"
+  VLLM_B12X_W4A16_FORCE_BLOCKS_MAX_M: "16"
+  VLLM_B12X_W4A16_FORCE_TILE_CONFIG: ""
+  B12X_W4A16_TC_DECODE: "0"
+  # --- DSpark drafter switches from the validated 1M run ---
+  VLLM_DSPARK_CONFIDENCE_THRESHOLD: "0.0"
+  VLLM_DSPARK_CONFIDENCE_SCHEDULER: "off"
+  VLLM_DSPARK_LOCAL_ARGMAX: "1"
+  VLLM_DSPARK_REPLICATE_MARKOV_W1: "1"
+  VLLM_DSPARK_FUSED_MARKOV_ARGMAX: "0"
+  VLLM_DSPARK_GPU_REJECTED_CONTEXT_MASK: "1"
+  VLLM_DSPARK_REFERENCE_KV_QUANT_DEQUANT: "0"
+  VLLM_DSPARK_HARDWARE_SCHEDULER_EARLY_STOP: "1"
+  VLLM_DSV4_B12X_COMPRESSED_MLA: "0"
+  VLLM_DSV4_DSPARK_DEFER_TARGET_CAPTURE: "0"
+  VLLM_DSV4_DSPARK_DEFER_TARGET_CAPTURE_EXACT: "0"
+  # --- vLLM runtime defaults ---
+  # Do NOT set VLLM_USE_V2_MODEL_RUNNER=1: hard-rejected with DSpark spec decode.
   VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
-  VLLM_USE_BREAKABLE_CUDAGRAPH: "0"
-  # Gated model — interpolated from the launching shell's HF_TOKEN (export it, or
-  # let it fall through from ~/.cache/huggingface/token). Never hardcode the secret here.
+  VLLM_TRITON_MLA_SPARSE: "1"
+  VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: "256"
+  VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS: "0"
+  VLLM_SKIP_INIT_MEMORY_CHECK: "1"
+  PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+  # --- JIT / toolchain (paths are Stage-C-image specific) ---
+  DG_JIT_USE_NVRTC: "0"
+  DG_JIT_NVCC_COMPILER: /opt/env/bin/nvcc
+  TILELANG_CLEANUP_TEMP_FILES: "1"
+  FLASHINFER_DISABLE_VERSION_CHECK: "1"
+  # --- HF ---
+  HF_HUB_DISABLE_XET: "1"
+  # Public (non-gated) checkpoint — a token is NOT required, but passing one avoids
+  # anonymous rate limits. Interpolated from the launching shell; never hardcode it.
   HF_TOKEN: "${HF_TOKEN}"
-  # --- Homelab additions (not from the forum) ---
+  # --- Homelab additions (not upstream) ---
   # Headless peer (node_rank 1) worker crashes under vLLM's default `spawn` restoring
   # a multiprocessing semaphore (synchronize.py __setstate__ -> FileNotFoundError on
   # /dev/shm/mp-*), hanging the head at NCCL rendezvous. `fork` inherits semaphores.
@@ -85,29 +142,36 @@ env:
   # CUDA arch (GB10 = sm_121a / Blackwell) — repo convention, matters at build time.
   TORCH_CUDA_ARCH_LIST: 12.1a
   FLASHINFER_CUDA_ARCH_LIST: 12.1a
-  # NCCL over the ConnectX-7 / InfiniBand-RoCE link between the two Sparks (homelab
-  # standard IB tuning; the forum specified only ray + CX-7 MTU 9000). Adjust if
-  # cross-node all-reduce misbehaves.
+  # NCCL over the ConnectX-7 / InfiniBand-RoCE link between the two Sparks. Upstream
+  # runs RoCE on 192.168.192.0/24 with per-node NCCL_IB_HCA / NCCL_SOCKET_IFNAME; those
+  # are left to sparkrun. GID_INDEX 3 is the homelab value (upstream's example says 0).
   NCCL_NET: IB
-  NCCL_IB_DISABLE: 0
-  NCCL_IB_GID_INDEX: 3
-  NCCL_CROSS_NIC: 1
-  NCCL_CUMEM_ENABLE: 0
-  NCCL_IGNORE_CPU_AFFINITY: 1
+  NCCL_IB_DISABLE: "0"
+  NCCL_IB_GID_INDEX: "3"
+  NCCL_CROSS_NIC: "1"
+  NCCL_CUMEM_ENABLE: "0"
+  NCCL_IGNORE_CPU_AFFINITY: "1"
+  NCCL_NVLS_ENABLE: "0"
   NCCL_DEBUG: WARN
 
-# Serve command template (forum's DSpark recipe, adapted for sparkrun).
+# Serve command template (upstream's docker-compose.dspark.yml command, adapted).
 #
-# The JSON blobs (--speculative-config, --hf-overrides, --reasoning-config) contain
-# literal `{...}` and CANNOT hold {placeholders} — the spec-token count (5), the
-# dspark_noise_token_id (128799), and the reasoning parser are hardcoded there.
+# The JSON blobs (--speculative-config, --reasoning-config, --default-chat-template-kwargs)
+# contain literal `{...}` and CANNOT hold {placeholders} — the spec-token count (3), the
+# probabilistic draft sampler, and the thinking flag are hardcoded there.
 #
-# NO --distributed-executor-backend here: the forum passes `ray`, but that is for its
-# HAND-ROLLED ray cluster (single vllm serve, no --nnodes). sparkrun's vllm-distributed
-# runtime injects vLLM's native multi-node flags (--nnodes N --node-rank R
-# --master-addr/--master-port, one vllm per node), and vLLM 0.23 REJECTS `ray`
-# together with nnodes>1 ("can only be set when backend is mp, uni or
-# external_launcher"). Matches every other 2-node recipe here. See README.
+# NO --distributed-executor-backend / --nnodes / --node-rank / --master-addr /
+# --master-port / --headless here: upstream's compose hand-rolls all of them per node,
+# but sparkrun's vllm-distributed runtime injects the native multi-node flags itself and
+# picks a compatible backend (upstream passes `mp`, which is what vLLM defaults to for
+# nnodes>1 anyway). Matches every other 2-node recipe here. See README.
+#
+# Deliberately ABSENT (upstream flags these as breakage):
+#   --override-generation-config  -> removed in the 2026-07-03 garble fix (its
+#                                    repetition_penalty=1.05 is a spec-decode crash risk)
+#   --attention-backend FLASHINFER_MLA_SPARSE_DSV4 -> backend name does not exist on this
+#                                    image; leave attention AUTO so it picks the DSV4
+#                                    sparse MLA path that works with nvfp4_ds_mla
 command: |
   vllm serve {model} \
       --served-model-name {served_model_name} \
@@ -121,15 +185,17 @@ command: |
       --max-model-len {max_model_len} \
       --max-num-seqs {max_num_seqs} \
       --max-num-batched-tokens {max_num_batched_tokens} \
+      --max-cudagraph-capture-size {max_cudagraph_capture_size} \
       --gpu-memory-utilization {gpu_memory_utilization} \
-      --load-format {load_format} \
       --enable-prefix-caching \
-      --speculative-config '{"method":"dspark","num_speculative_tokens":5}' \
-      --hf-overrides '{"dspark_noise_token_id":128799}' \
+      --async-scheduling \
+      --enable-chunked-prefill \
+      --speculative-config '{"method":"dspark","num_speculative_tokens":3,"draft_sample_method":"probabilistic"}' \
       --tokenizer-mode deepseek_v4 \
       --tool-call-parser deepseek_v4 \
       --enable-auto-tool-choice \
       --reasoning-parser deepseek_v4 \
-      --reasoning-config '{"reasoning_parser":"deepseek_v4"}' \
-      --default-chat-template-kwargs.thinking=true \
-      --default-chat-template-kwargs.reasoning_effort=high
+      --reasoning-config '{"reasoning_parser":"deepseek_v4","reasoning_start_str":"<think>","reasoning_end_str":"</think>"}' \
+      --default-chat-template-kwargs '{"thinking":false}' \
+      --generation-config vllm \
+      --enable-flashinfer-autotune

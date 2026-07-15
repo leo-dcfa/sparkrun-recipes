@@ -7,7 +7,7 @@
 #   make qwen                             # launch Qwen3.6-27B FP8+MTP (official)
 #   make qwen35                           # launch Qwen3.6-35B-A3B NVFP4-Fast + MTP, 1M ctx (local)
 #   make hy3                              # launch Hy3-295B NVFP4-W4A16 + MTP (local)
-#   make deepseek-dspark                  # launch DeepSeek-V4-Flash + DSpark drafter (local)
+#   make deepseek-dspark                  # launch DeepSeek-V4-Flash + DSpark drafter, NVFP4 KV, 1M ctx (local)
 #   make deepseek MAX_MODEL_LEN=1000000   # override context length
 #   make deepseek-dry                     # VRAM/fit estimate, no launch
 #   make stop                             # stop everything on the cluster
@@ -33,8 +33,9 @@ QWEN35_RECIPE         := recipes/qwen3.6-35b-a3b-nvfp4-fast.yaml
 
 # Local recipes (this repo) — run by file path, no registry needed.
 HY3_RECIPE            := recipes/hy3-295b-nvfp4.yaml
-# DeepSeek-V4-Flash + DSpark drafter (eugr's vllm-node image). Distinct from the
-# published DEEPSEEK_RECIPE above (which is fp8 + MTP). fp8 KV, cross-node TP2.
+# DeepSeek-V4-Flash + DSpark drafter (tonyd2wild's locally-built Stage C NVFP4 image).
+# Distinct from the published DEEPSEEK_RECIPE above (which is fp8 + MTP).
+# nvfp4_ds_mla KV, 1M ctx, cross-node TP2 — see README (needs the image built first).
 DEEPSEEK_DSPARK_RECIPE := recipes/deepseek-v4-flash-dspark.yaml
 
 # Optional overrides — set on the command line, e.g.
@@ -82,7 +83,7 @@ qwen35: ## Launch Qwen3.6-35B-A3B NVFP4-Fast + MTP, 1M ctx (local, 1-node)
 hy3: ## Launch Hy3-295B NVFP4-W4A16 + MTP (local, 2-node)
 	$(RUN) $(HY3_RECIPE) $(OVERRIDES)
 
-deepseek-dspark: ## Launch DeepSeek-V4-Flash + DSpark drafter (local, 2-node, fp8 KV)
+deepseek-dspark: ## Launch DeepSeek-V4-Flash + DSpark drafter (local, 2-node, NVFP4 KV, 1M ctx)
 	$(RUN) $(DEEPSEEK_DSPARK_RECIPE) $(OVERRIDES)
 
 ## --- dry-run / VRAM fit estimate (no launch) ------------------------------
