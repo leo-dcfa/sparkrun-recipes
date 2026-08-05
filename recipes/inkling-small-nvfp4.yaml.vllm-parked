@@ -1,0 +1,91 @@
+# Recipe: TML Inkling-Small NVFP4 (multimodal MoE) for DGX Spark GB10, 2 nodes
+# Source: official vLLM recipe https://recipes.vllm.ai/thinkingmachines/Inkling-Small
+#         (serve flags + env adopted verbatim 2026-07-31; W4A4 NVFP4 needs >=180 GB
+#         aggregate VRAM -> TP=2 across both Sparks).
+#
+# Thinking Machines Inkling-Small: 276B total / 12B active MoE, natively
+# multimodal (text+image+audio in, text out), hybrid attention (35 of 42
+# layers are SWA-512 local), 1M ctx ceiling. Weights ~171 GB NVFP4 ->
+# ~85 GB/node at TP=2.
+#
+# Needs a vLLM NIGHTLY with Inkling support (min 0.26.0, landed ~2026-07-27;
+# model released 2026-07-27). The spark-arena eugr nightly :latest tag is the
+# rolling lane for that — `docker pull` on BOTH nodes before launching, or the
+# stale local :latest will boot and fail with an unknown-architecture error
+# (inkling_mm_model / InklingForConditionalGeneration).
+#
+# *** THIS SPARKRUN LANE IS PARKED (2026-07-31) — `make inkling` uses eugr's
+# *** spark-vllm-docker (~/spark-vllm-docker, recipe inkling-small-nvfp4).
+# First launch attempt under sparkrun (vLLM 0.26.1rc1.dev30, 2026-07-31) died
+# at engine init: TP0 exited silently during checkpoint load, no OOM/Xid.
+# Two GB10-specific hazards, both handled only by eugr's launcher mods:
+#  - Inkling's fused Lamport RS-conv collective demands MNNVL fabric for
+#    cross-node TP ("cross-node TP is supported only on MNNVL fabric");
+#    logged as survivable NCCL fallback, but eugr disables it outright via
+#    LAMPORT_RS_SCONV=0 (mirrored in env below).
+#  - Inkling's FA4 relative-attention path lacks SM12x paged-KV — needs
+#    eugr's mods/inkling-sm12-paged-kv source patch (vendored FA4-SM120
+#    bundle), which sparkrun has no mechanism to apply.
+# Revisit this yaml once vLLM's pinned FA4 gains SM120 paged-KV; until then
+# it exists for `make inkling-dry` VRAM estimates and as documentation.
+#
+# NOT YET SET (revisit after first bring-up):
+#  - MTP spec decoding: the model ships 8 chained MTP heads but stable vLLM
+#    only takes 1 speculative token for now — add
+#    --speculative-config '{"method":"mtp","num_speculative_tokens":1}'
+#    once the plain lane is verified coherent.
+#  - audio inputs require the vllm[audio] extra inside the image; text+image
+#    work without it.
+#  - max_model_len 262144 is a conservative first cut (model supports 1M) —
+#    check `make inkling-dry` / the boot-log KV headroom before raising.
+#  - kv_cache_dtype left at auto; fp8/nvfp4 KV unvalidated on the inkling
+#    hybrid-attention path.
+
+recipe_version: "1"
+name: Inkling-Small-NVFP4
+model: thinkingmachines/Inkling-Small-NVFP4
+runtime: vllm-distributed
+min_nodes: 2
+
+# Requires two Sparks (1 GB10 each -> tensor_parallel 2). Will not run solo.
+cluster_only: true
+
+container: ghcr.io/spark-arena/dgx-vllm-eugr-nightly:latest
+
+metadata:
+  description: TML Inkling-Small NVFP4 (276B-A12B multimodal MoE) on 2x DGX Spark GB10, TP=2, 256K ctx
+  maintainer: local (leo)
+  source: https://recipes.vllm.ai/thinkingmachines/Inkling-Small
+  base_model: thinkingmachines/Inkling-Small
+  model_dtype: nvfp4
+  vllm_version: ">=0.26.0 nightly with Inkling support"
+
+# Defaults — override on the CLI with -o key=value or the dedicated flags.
+defaults:
+  host: 0.0.0.0
+  port: 8000
+  served_model_name: inkling-small
+  tensor_parallel: 2
+  gpu_memory_utilization: 0.85
+  max_model_len: 262144
+
+# First two env vars are from the official recipe's base_env — load-bearing
+# there, carried verbatim. LAMPORT_RS_SCONV=0 skips the fused collective that
+# requires MNNVL fabric (from eugr's recipe — see header).
+env:
+  VLLM_USE_V2_MODEL_RUNNER: "1"
+  FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED: "1"
+  LAMPORT_RS_SCONV: "0"
+
+command: |
+  vllm serve {model} --host {host} --port {port} \
+    --served-model-name {served_model_name} \
+    --trust-remote-code \
+    --tokenizer-mode inkling \
+    --reasoning-parser inkling \
+    --tool-call-parser inkling \
+    --enable-auto-tool-choice \
+    -tp {tensor_parallel} \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --max-model-len {max_model_len} \
+    --kernel-config.enable_flashinfer_autotune=False

@@ -1,0 +1,160 @@
+# Recipe: TML Inkling-Small NVFP4 (multimodal MoE) for DGX Spark GB10, 2 nodes,
+#         SGLang + DSpark drafts, NVFP4 KV, 1M ctx
+# Source: MiaAI's dual-Spark wrapper around drowzeys' champion runtime, adopted
+#         2026-08-06:
+#         https://github.com/MiaAI-Lab/Inkling-Small-NVFP4-Dual-DGX-Sparks
+#         (server args/env verbatim from start_sglang.sh; her plumbing — SSH,
+#         SSHFS, image sync — is replaced by sparkrun here)
+#         Champion runtime + patched image:
+#         https://github.com/drowzeys/keys-1M-CTX-Inkling-Small-NVFP4-Dspark-NVFP4-KV-Cache-SGlang-SM121-optimized-on-Two-DGX-Sparks
+#         MiaAI measured (2x DGX Spark, TP=2): ~34 tok/s single stream,
+#         ~79 tok/s at 6 sessions, >90% draft acceptance, 1,142,712-token KV
+#         pool at mem-fraction 0.85.
+#
+# Thinking Machines Inkling-Small: 276B total / 12B active MoE, natively
+# multimodal (text+image+audio in, text out), hybrid attention (35 of 42
+# layers SWA-512), 1M ctx. This REPLACES (2026-08-06) both:
+#  - the parked vLLM lane that used to live in this file (died at engine init
+#    on GB10 — FA4 path lacked SM12x paged-KV; kept at
+#    recipes/inkling-small-nvfp4.yaml.vllm-parked), and
+#  - the eugr spark-vllm-docker deploy `make inkling` used at 256K ctx
+#    (kept as `make inkling-eugr` fallback until this lane is verified).
+#
+# COMMUNITY / UNVERIFIED on this host (adopted 2026-08-06, not yet launched
+# here). Both models must be warm on BOTH nodes before launch (MiaAI shares
+# the head cache over SSHFS; sparkrun mounts each node's own cache):
+#     huggingface-cli download thinkingmachines/Inkling-Small-NVFP4
+#     huggingface-cli download RadixArk/Inkling-Small-DSpark-Preview
+#     docker pull ghcr.io/drowzeys/inkling-sglang-gb10:kvquant   # on BOTH nodes
+#
+# Champion-config landmines (all from drowzeys/MiaAI, do not "clean up"):
+#  - page-size MUST be 1 — larger pages corrupt the triton DSpark verify path
+#    (silent correctness errors, not a crash).
+#  - kv fp4_mx_block16, NOT nvfp4 — nvfp4 selects the flashinfer/trtllm packing
+#    the triton attention lane cannot read.
+#  - fp32 attention reduce (--triton-attention-reduce-in-fp32): bf16 reduce
+#    perturbs logits and costs ~11 points of draft acceptance.
+#  - DSpark block-size 7 is the measured optimum; 15 regresses.
+#  - explicit --cuda-graph-bs list: SGLang's default --cuda-graph-max-bs
+#    filtering OOMs the pool; keep bs=1 in the list (single-request warmup).
+#  - prefill + piecewise CUDA graphs stay disabled: triton can't replay
+#    EXTEND, and the sm_121 piecewise compiler hard-fails.
+#  - SGLANG_RAGGED_VERIFY_MODE stays UNSET (compact crashes Inkling's sconv JIT).
+#  - the kvquant image ships ENTRYPOINT "true" — executor_config.entrypoint
+#    below clears it, and the command launches python3 -m sglang.launch_server
+#    directly (bare `sglang` won't exist).
+#  - INKLING_TORCH_CONV_COMMIT / INKLING_COMMIT_STEP_BIAS fix a DSpark
+#    conv-state commit bug that only appears under multi-node TP=2 (patches
+#    baked into the image's inkling.py; the env vars arm them).
+#  - draft is 64K-adapted: INKLING_DRAFT_CTX_CAP=65536 caps it independently
+#    of the 1M target context (baked patch reads this).
+
+recipe_version: "2"
+name: Inkling-Small-NVFP4
+model: thinkingmachines/Inkling-Small-NVFP4
+runtime: sglang
+min_nodes: 2
+
+# Requires two Sparks (1 GB10 each -> tensor_parallel 2). Will not run solo.
+cluster_only: true
+
+# drowzeys champion image: lmsysorg/sglang:dev + fp4 KV triton lane, DSpark
+# conv-commit fix, draft ctx cap, 12.1a arch pins baked in.
+container: ghcr.io/drowzeys/inkling-sglang-gb10:kvquant
+
+# The kvquant image ships ENTRYPOINT ["true"], which swallows sparkrun's
+# bash -c serve command — the container exits 0 instantly and sparkrun
+# auto-removes it, leaving no logs ("Head node failed to become ready", hit
+# 2026-08-06). Clearing the entrypoint here is REQUIRED (same trick as the
+# atlas runtime; MiaAI's start_sglang.sh uses --entrypoint python3).
+executor_config:
+  entrypoint: ""
+
+metadata:
+  description: TML Inkling-Small NVFP4 (276B-A12B multimodal MoE) on 2x DGX Spark GB10, SGLang + DSpark drafts, NVFP4 KV, TP=2, 1M ctx
+  maintainer: local (leo)
+  source: https://github.com/MiaAI-Lab/Inkling-Small-NVFP4-Dual-DGX-Sparks
+  base_model: thinkingmachines/Inkling-Small
+  model_dtype: nvfp4
+  kv_cache: fp4_mx_block16 (triton lane)
+  draft_method: dspark (RadixArk/Inkling-Small-DSpark-Preview, unquant, block 7)
+  sglang_version: "drowzeys kvquant image (lmsysorg/sglang:dev base)"
+
+# Defaults — drowzeys champion profile verbatim (only the port differs — the
+# homelab convention is :8000; MiaAI serves on :8888).
+defaults:
+  host: 0.0.0.0
+  port: 8000
+  served_model_name: inkling-small
+  tensor_parallel: 2
+  gpu_memory_utilization: 0.85
+  max_model_len: 1048576
+  max_running_requests: 16
+  page_size: 1
+  chunked_prefill_size: 8192
+  kv_cache_dtype: fp4_mx_block16
+  draft_model: RadixArk/Inkling-Small-DSpark-Preview
+  dspark_block_size: 7
+
+env:
+  # Mirrors recipes/inkling-small-nvfp4.env — keep the two in sync.
+  # DSpark conv-state commit fix (multi-node TP=2 bug; baked patches read these).
+  INKLING_TORCH_CONV_COMMIT: '1'
+  INKLING_COMMIT_STEP_BIAS: '1'
+  INKLING_NOOP_CONV_COMMIT: '0'
+  INKLING_DRAFT_CTX_CAP: '65536'
+  SGLANG_ENABLE_UNIFIED_RADIX_TREE: '1'
+  TORCH_CUDA_ARCH_LIST: '12.1a'
+  FLASHINFER_CUDA_ARCH_LIST: '12.1a'
+  PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+  PYTHONWARNINGS: ignore::SyntaxWarning
+  # NCCL RoCE set — champion values (NB: CROSS_NIC=0 here, unlike the vLLM
+  # lanes' 1; that is drowzeys' tested value for the SGLang rendezvous).
+  NCCL_NET: IB
+  NCCL_NET_PLUGIN: none
+  NCCL_IB_DISABLE: '0'
+  NCCL_IB_GID_INDEX: '3'
+  NCCL_IB_ROCE_VERSION_NUM: '2'
+  NCCL_CROSS_NIC: '0'
+  NCCL_CUMEM_ENABLE: '0'
+  NCCL_IGNORE_CPU_AFFINITY: '1'
+  NCCL_NVLS_ENABLE: '0'
+  NCCL_DEBUG: WARN
+
+# Serve command — drowzeys champion invocation (nvfp4-kv-boot.sh /
+# inkling-sglang-launch.sh via MiaAI's start_sglang.sh), adapted to sparkrun
+# placeholders. Multi-node flags (--nnodes/--node-rank/--dist-init-addr) are
+# injected by the sglang runtime — do not hand-add.
+command: |
+  python3 -m sglang.launch_server \
+    --model-path {model} \
+    --trust-remote-code \
+    --served-model-name {served_model_name} \
+    --tp-size {tensor_parallel} \
+    --context-length {max_model_len} \
+    --quantization modelopt_fp4 \
+    --attention-backend triton \
+    --triton-attention-reduce-in-fp32 \
+    --page-size {page_size} \
+    --fp4-gemm-backend flashinfer_trtllm \
+    --moe-runner-backend marlin \
+    --mamba-radix-cache-strategy extra_buffer \
+    --mem-fraction-static {gpu_memory_utilization} \
+    --swa-full-tokens-ratio 0.1 \
+    --mamba-full-memory-ratio 0.1 \
+    --max-running-requests {max_running_requests} \
+    --chunked-prefill-size {chunked_prefill_size} \
+    --kv-cache-dtype {kv_cache_dtype} \
+    --reasoning-parser inkling \
+    --tool-call-parser inkling \
+    --skip-server-warmup \
+    --disable-flashinfer-autotune \
+    --stream-interval 32 \
+    --speculative-algorithm DSPARK \
+    --speculative-draft-model-path {draft_model} \
+    --speculative-draft-model-quantization unquant \
+    --speculative-dspark-block-size {dspark_block_size} \
+    --disable-prefill-cuda-graph \
+    --disable-piecewise-cuda-graph \
+    --cuda-graph-bs 1 2 3 4 5 6 7 8 10 12 14 16 \
+    --host {host} --port {port}

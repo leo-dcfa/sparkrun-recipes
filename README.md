@@ -364,3 +364,47 @@ Launch: `make qwen35` (single node, TP=1); fit-check: `make qwen35-dry`.
   recipes, also 1M-capable with the same YaRN blob) and BF16 (~70 GiB, ~4x
   reads). This NVFP4-Fast recipe is the speed end of that curve; the FP8
   official recipes are the quality end.
+
+## inkling-small-nvfp4 (v2, SGLang + DSpark) — caveats
+
+Rewritten 2026-08-06 to MiaAI's dual-Spark wrapper around drowzeys' champion
+SGLang runtime ([MiaAI-Lab/Inkling-Small-NVFP4-Dual-DGX-Sparks](https://github.com/MiaAI-Lab/Inkling-Small-NVFP4-Dual-DGX-Sparks)) —
+1M ctx, DSpark drafts, NVFP4 KV. Replaces the parked vLLM lane (kept at `recipes/inkling-small-nvfp4.yaml.vllm-parked`)
+and the eugr spark-vllm-docker deploy (`make inkling-eugr` fallback, 256K).
+**Unverified on this host.**
+
+- **Prep on BOTH nodes before first launch:** pull the champion image
+  `ghcr.io/drowzeys/inkling-sglang-gb10:kvquant` and download BOTH models
+  (`thinkingmachines/Inkling-Small-NVFP4` + draft
+  `RadixArk/Inkling-Small-DSpark-Preview`). MiaAI SSHFS-shares the head cache;
+  sparkrun mounts each node's own.
+- **Do not "clean up" the champion flags.** page-size must be 1 (larger pages
+  silently corrupt DSpark verify); KV dtype is `fp4_mx_block16` NOT `nvfp4`
+  (wrong packing for the triton lane); fp32 attention reduce is worth ~11
+  points of draft acceptance; DSpark block 7 beats 15; the explicit
+  `--cuda-graph-bs` list avoids a pool OOM; prefill/piecewise graphs stay off
+  on sm_121. `SGLANG_RAGGED_VERIFY_MODE` must stay unset.
+- **Expected numbers (MiaAI, same hardware):** ~34 tok/s single stream,
+  ~79 tok/s at 6 sessions, >90% acceptance, ~1.14M-token KV pool at 0.85.
+- **Multimodal:** text+image+audio in, text out. Served name stays
+  `inkling-small` (LiteLLM/opencode/Zed map to it).
+
+## step-3.7-flash-nvfp4 — caveats
+
+MiaAI's dual-Spark **no-MTP** lane for `stepfun-ai/Step-3.7-Flash-NVFP4`
+([MiaAI-Lab/Dual-DGX-Spark-Step-3.7-Flash-NVFP4](https://github.com/MiaAI-Lab/Dual-DGX-Spark-Step-3.7-Flash-NVFP4)),
+adopted 2026-08-06. 256K ctx, fp8 KV, step3p5 parsers, ~30-33 tok/s on 2x
+Spark per her Aug 2026 lineup. **Unverified on this host.**
+
+- **Build the container on BOTH nodes first:**
+  `docker build -f docker/Dockerfile.stepfun37-procps -t vllm-stepfun37:procps-nccl .`
+  — adds procps (sparkrun liveness) and bakes MiaAI's NCCL load-order fix
+  (pip libnccl shadows the system RoCE one in official vLLM images). Do not
+  run bare `vllm/vllm-openai:stepfun37`.
+- **MTP not wired.** MiaAI's faster MTP lane needs her `graft-mtp.sh` weight
+  graft plus an in-container `step3p5_mtp.py` patch; sparkrun has no hook for
+  either. Plain lane first.
+- **NCCL_IB_GID_INDEX is 3 here** (homelab CX-7 value); MiaAI's example uses 0.
+  If rendezvous stalls, try 0 first.
+- **eugr alternative:** `@eugr/step-3.7-flash-nvfp4` (Ray + instanttensor). Not
+  used — this lane matches MiaAI's tested numbers.

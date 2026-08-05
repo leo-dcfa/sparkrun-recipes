@@ -1,0 +1,113 @@
+# Recipe: StepFun Step-3.7-Flash NVFP4 for DGX Spark GB10, 2 nodes, 256K ctx
+# Source: MiaAI's dual-Spark deployment, adopted 2026-08-06:
+#         https://github.com/MiaAI-Lab/Dual-DGX-Spark-Step-3.7-Flash-NVFP4
+#         (serve flags verbatim from templates/launch-no-mtp.sh + config.env.example;
+#         recommended in her Aug 2026 lineup: ~30-33 tok/s single stream on 2x Spark,
+#         "even when in deep context"). eugr also ships @eugr/step-3.7-flash-nvfp4
+#         (Ray executor + instanttensor load) — this lane follows MiaAI's no-Ray
+#         torch-distributed profile instead, matching her tested numbers.
+#
+# StepFun Step-3.7-Flash (NVFP4, ~197B MoE): text-only, 256K ctx ceiling.
+# vLLM official image vllm/vllm-openai:stepfun37 has the step3p5 parsers and
+# model support baked in; the local build below only adds procps (sparkrun
+# liveness-check requirement — same gotcha as Dockerfile.ds4-procps) and bakes
+# MiaAI's NCCL load-order fix (the pip-installed libnccl.so.2 shadows the
+# system RoCE-aware one; her launch scripts re-symlink it at startup, we do it
+# at build time). Build on BOTH nodes:
+#     docker build -f docker/Dockerfile.stepfun37-procps -t vllm-stepfun37:procps-nccl .
+#
+# COMMUNITY / UNVERIFIED on this host (adopted 2026-08-06, not yet launched here).
+#
+# NOT YET SET (revisit after first bring-up):
+#  - MTP spec decoding (~+speedup, MiaAI's launch-mtp.sh lane): needs her
+#    graft-mtp.sh weight graft (BF16 MTP tensors grafted into the NVFP4
+#    checkpoint) plus a step3p5_mtp.py source patch ("local_mtp_unquant_hack")
+#    applied in-container — sparkrun has no mod hook for either. Run the plain
+#    lane first; graft later if the ~3-token MTP lane is wanted.
+#  - NCCL_IB_GID_INDEX: MiaAI's example config uses 0; every validated homelab
+#    lane uses 3 (RoCEv2 GID on this CX-7 pair) — kept at 3 here. If NCCL
+#    rendezvous stalls, this is the first knob to try at 0.
+#  - kv fp8 + modelopt quantization are MiaAI's tested pair; don't swap in
+#    nvfp4 KV without benching (Step has no nvfp4-KV lane anywhere yet).
+
+recipe_version: "1"
+name: Step-3.7-Flash-NVFP4
+model: stepfun-ai/Step-3.7-Flash-NVFP4
+runtime: vllm-distributed
+min_nodes: 2
+
+# Requires two Sparks (1 GB10 each -> tensor_parallel 2). Will not run solo.
+cluster_only: true
+
+# Local build — see header. Do NOT fall back to bare vllm/vllm-openai:stepfun37
+# (no procps -> sparkrun liveness check kills the container; pip NCCL shadows
+# the system RoCE lib).
+container: vllm-stepfun37:procps-nccl
+
+# The official image ships ENTRYPOINT ["vllm serve"], which eats sparkrun's
+# bash bootstrap as CLI args (argparse dies on --compilation-config JSON,
+# hit 2026-08-06). Clearing the entrypoint is REQUIRED so the command below
+# runs under bash like every other lane.
+executor_config:
+  entrypoint: ""
+
+metadata:
+  description: StepFun Step-3.7-Flash NVFP4 on 2x DGX Spark GB10, TP=2, fp8 KV, 256K ctx (MiaAI no-MTP lane)
+  maintainer: local (leo)
+  source: https://github.com/MiaAI-Lab/Dual-DGX-Spark-Step-3.7-Flash-NVFP4
+  base_model: stepfun-ai/Step-3.7-Flash
+  model_dtype: nvfp4
+  kv_cache: fp8
+  vllm_version: "vllm/vllm-openai:stepfun37 (official Step-3.7 image)"
+
+# Defaults — MiaAI's validated profile verbatim (only served_model_name and
+# port differ: homelab convention is short lowercase names on :8000; MiaAI
+# serves the full HF id on :8888).
+defaults:
+  host: 0.0.0.0
+  port: 8000
+  served_model_name: step-3.7-flash
+  tensor_parallel: 2
+  gpu_memory_utilization: 0.85
+  max_model_len: 262144
+  max_num_batched_tokens: 8192
+  max_num_seqs: 8
+  kv_cache_dtype: fp8
+  tool_call_parser: step3p5
+  reasoning_parser: step3p5
+
+env:
+  # Mirrors recipes/step-3.7-flash-nvfp4.env — keep the two in sync.
+  PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+  # Homelab NCCL RoCE set (CX-7 direct link) — same block as the DeepSeek
+  # lanes; MiaAI's repo relies on host defaults + GID 0, see header note.
+  NCCL_NET: IB
+  NCCL_IB_DISABLE: '0'
+  NCCL_IB_GID_INDEX: '3'
+  NCCL_IB_ADDR_FAMILY: AF_INET
+  NCCL_IB_ROCE_VERSION_NUM: '2'
+  NCCL_CROSS_NIC: '1'
+  NCCL_CUMEM_ENABLE: '0'
+  NCCL_IGNORE_CPU_AFFINITY: '1'
+  NCCL_NVLS_ENABLE: '0'
+  NCCL_DEBUG: WARN
+
+# Serve command — MiaAI's templates/launch-no-mtp.sh verbatim, adapted to
+# sparkrun placeholders. Multi-node flags (--nnodes/--node-rank/--master-addr/
+# --headless) are injected by the vllm-distributed runtime — do not hand-add.
+command: |
+  vllm serve {model} --host {host} --port {port} --trust-remote-code \
+    --served-model-name {served_model_name} \
+    --tensor-parallel-size {tensor_parallel} \
+    --max-model-len {max_model_len} \
+    --max-num-batched-tokens {max_num_batched_tokens} \
+    --max-num-seqs {max_num_seqs} \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --quantization modelopt \
+    --kv-cache-dtype {kv_cache_dtype} \
+    --disable-cascade-attn \
+    --disable-custom-all-reduce \
+    --no-enable-flashinfer-autotune \
+    --enable-auto-tool-choice \
+    --reasoning-parser {reasoning_parser} \
+    --tool-call-parser {tool_call_parser}

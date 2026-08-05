@@ -1,0 +1,38 @@
+# Local overlay on the official Step-3.7 vLLM image for sparkrun on DGX Spark.
+# Build on BOTH nodes before `make step`:
+#     docker build -f docker/Dockerfile.stepfun37-procps -t vllm-stepfun37:procps-nccl .
+#
+# Adds:
+#  1. procps — sparkrun's liveness check needs `ps` in the container (same
+#     gotcha as Dockerfile.ds4-procps; without it sparkrun kills the workload
+#     shortly after launch).
+#  2. MiaAI's NCCL load-order fix, baked at build time instead of her runtime
+#     fix_nccl_load_order(): the pip-installed nvidia/nccl libnccl.so.2 inside
+#     official vLLM images shadows the system (RoCE-aware) NCCL on DGX Spark —
+#     re-symlink pip's copy at the system library. See
+#     https://github.com/MiaAI-Lab/Dual-DGX-Spark-Step-3.7-Flash-NVFP4
+#     templates/launch-no-mtp.sh for the original runtime version.
+
+FROM vllm/vllm-openai:stepfun37
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends procps \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN set -eu; \
+    sys=/usr/lib/aarch64-linux-gnu/libnccl.so.2; \
+    if [ -e "$sys" ]; then \
+      for d in /usr/local/lib/python3.12/dist-packages \
+               /usr/local/lib/python3.12/site-packages \
+               /opt/venv/lib/python3.12/site-packages \
+               /opt/env/lib/python3.12/site-packages; do \
+        f="$d/nvidia/nccl/lib/libnccl.so.2"; \
+        if [ -e "$f" ] && [ "$(readlink -f "$f")" != "$(readlink -f "$sys")" ]; then \
+          mv "$f" "$f.spark-vllm-backup"; \
+          ln -s "$sys" "$f"; \
+          echo "NCCL re-symlinked: $f -> $sys"; \
+        fi; \
+      done; \
+    else \
+      echo "No system libnccl.so.2 found; leaving pip NCCL in place"; \
+    fi
