@@ -1,0 +1,68 @@
+# Recipe: DeepSeek-V4-Flash (fp8 KV + MTP) for DGX Spark GB10, 2 nodes — MAIN lane
+# Source: Spark Arena benchmark 443dcd0a-8a88-492b-917c-485d6261334e (author J C)
+#         — 37.80 tok/s TG. Adopted verbatim 2026-07-23 (only addition:
+#         served_model_name for the LiteLLM mapping).
+#         https://spark-arena.com/benchmark/443dcd0a-8a88-492b-917c-485d6261334e
+#
+# 256K ctx, MTP-2, instanttensor load, scitrera jasl-ds4 image (already on both
+# nodes). For the 1M-ctx variant of this lane (MiaAI aidendle94 image, verified
+# working 2026-07-23 but unbenchmarked) see deepseek-v4-flash-1m.yaml.
+
+model: deepseek-ai/DeepSeek-V4-Flash
+container: scitrera/dgx-spark-vllm-jasl-ds4:20260609
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  served_model_name: deepseek-v4-flash
+  tensor_parallel: 2
+  gpu_memory_utilization: 0.825
+  max_model_len: 256000
+  max_num_batched_tokens: 6144
+  max_num_seqs: 10
+  tool_call_parser: deepseek_v4
+  pipeline_parallel: 1
+  data_parallel: 1
+  max_cudagraph_capture_size: 8
+  load_format: instanttensor
+  kv_cache_dtype: fp8
+  reasoning_parser: deepseek_v4
+  tokenizer_mode: deepseek_v4
+  speculative_config: '{"method": "mtp", "num_speculative_tokens": 2}'
+  compilation_config: '{"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"]}'
+env:
+  # Engine-ready timeout raised from the vLLM default 600s: cold-cache 2-node
+  # loads (hy3 took 868s on 2026-08-15) outlive the default and cascade into
+  # shm/NCCL "cancelled" crashes at load completion.
+  VLLM_ENGINE_READY_TIMEOUT_S: "5400"
+  TILELANG_CLEANUP_TEMP_FILES: '1'
+  VLLM_TRITON_MLA_SPARSE: '1'
+  VLLM_TRITON_MLA_SPARSE_HEAD_BLOCK_SIZE: '4'
+  VLLM_TRITON_MLA_SPARSE_QUERY_CHUNK_SIZE: '512'
+  VLLM_TRITON_MLA_SPARSE_TOPK_CHUNK_SIZE: '512'
+command: |
+  vllm serve {model} \
+    --host {host} \
+    --port {port} \
+    --served-model-name {served_model_name} \
+    --max-model-len {max_model_len} \
+    --max-num-seqs {max_num_seqs} \
+    --max-num-batched-tokens {max_num_batched_tokens} \
+    --trust-remote-code \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --enable-auto-tool-choice \
+    --tool-call-parser {tool_call_parser} \
+    --tokenizer-mode {tokenizer_mode} \
+    --reasoning-parser {reasoning_parser} \
+    --kv-cache-dtype {kv_cache_dtype} \
+    --load-format {load_format} \
+    --speculative-config '{speculative_config}' \
+    --compilation-config '{compilation_config}' \
+    --enable-prefix-caching \
+    --max-cudagraph-capture-size {max_cudagraph_capture_size} \
+    -tp {tensor_parallel} \
+    -pp {pipeline_parallel}
+runtime: vllm
+min_nodes: 2
+metadata:
+  description: DeepSeek-V4-Flash (Spark Arena main lane)
+recipe_version: '2'

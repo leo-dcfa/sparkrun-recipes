@@ -1,0 +1,113 @@
+# Recipe: DeepSeek-V4-Flash (fp8 KV + MTP) for DGX Spark GB10, 2 nodes, 1M ctx
+# Source: https://github.com/MiaAI-Lab/DeepSeek-V4-Flash-Dual-DGX-Spark-1M-Context
+#
+# The MAIN DeepSeek lane (`make deepseek`) as of 2026-07-23 — replaces
+# @experimental/deepseek4-flash-fp8-mtp-vllm, which capped out well short of 1M.
+# Official deepseek-ai/DeepSeek-V4-Flash checkpoint across 2x DGX Spark (GB10),
+# cross-node TP=2, fp8 KV cache, MTP speculative decoding (2 draft tokens),
+# 1M-token context, prefix caching. Uses the PUBLISHED aidendle94 image (already
+# on this host — it's the same custom GB10 vLLM build sparkrun pulled before).
+#
+# NB: distinct from `make deepseek-dspark` (DSpark drafter + nvfp4_ds_mla KV on
+# the Anemll image). This is the plainer fp8+MTP lane: fewer moving parts, no
+# drafter checkpoint, slightly lower ceiling on decode speed.
+
+recipe_version: "1"
+name: DeepSeek-V4-Flash-1M
+# Official checkpoint — already in the host HF cache. Must be warm on BOTH
+# nodes (sparkrun containers run HF-offline; see the laguna recipe notes).
+model: deepseek-ai/DeepSeek-V4-Flash
+runtime: vllm-distributed
+min_nodes: 2
+
+# Requires two Sparks (1 GB10 each -> tensor_parallel 2). Will not run solo.
+cluster_only: true
+
+# LOCAL derived tag: aidendle94/sparkrun-vllm-ds4-gb10:production-ready
+# (MiaAI's custom GB10 vLLM build) + procps. The upstream image ships without
+# `ps`, which sparkrun's liveness check needs — without it every serve is
+# declared "exited immediately", the worker never launches, and the head times
+# out at c10d rendezvous ("1/2 clients joined"). Diagnosed 2026-07-23.
+# Build on BOTH nodes:
+#   docker build -f docker/Dockerfile.ds4-procps -t sparkrun-vllm-ds4-gb10:procps ~/sparkrun-recipes/docker
+container: sparkrun-vllm-ds4-gb10:procps
+
+metadata:
+  description: DeepSeek-V4-Flash fp8-KV + MTP on 2x DGX Spark GB10, cross-node TP=2, 1M ctx (MiaAI main lane)
+  maintainer: community (MiaAI-Lab/DeepSeek-V4-Flash-Dual-DGX-Spark-1M-Context)
+  source: https://github.com/MiaAI-Lab/DeepSeek-V4-Flash-Dual-DGX-Spark-1M-Context
+  base_model: deepseek-ai/DeepSeek-V4-Flash
+  draft_method: mtp
+  kv_cache: fp8
+  vllm_version: "custom aidendle94 GB10 build (version not published)"
+
+# Defaults — override on the CLI with -o key=value or the dedicated flags.
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  served_model_name: deepseek-v4-flash
+  tensor_parallel: 2
+  pipeline_parallel: 1
+  # MiaAI's own value for this lane (their compose uses 0.82) — under the 0.85
+  # earlyoom ceiling, so kept as-is rather than dropped to the usual 0.80.
+  gpu_memory_utilization: 0.82
+  # MiaAI serve 1,000,000 here (not the 1,048,576 YaRN ceiling the dspark lane
+  # uses) — keep their validated number.
+  max_model_len: 1000000
+  block_size: 256
+  max_num_seqs: 6
+  max_num_batched_tokens: 8192
+  kv_cache_dtype: fp8
+  # NB: MTP num_speculative_tokens (2) lives inside the literal JSON
+  # --speculative-config blob below (sparkrun brace-matching gotcha).
+
+# Environment variables (kept in sync with deepseek-v4-flash-1m.env).
+# MiaAI's compose sets NODE_RANK / MASTER_ADDR / HEADLESS / NCCL_IB_HCA /
+# NCCL_SOCKET_IFNAME per node — all left to sparkrun's vllm-distributed runtime.
+env:
+  VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
+  PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+  # NB: do NOT set VLLM_WORKER_MULTIPROC_METHOD=fork here (the usual homelab
+  # 2-node convention) — on this vLLM 0.21-era image the worker dies at
+  # init_device with "CUDA driver initialization failed" under fork
+  # (verified 2026-07-23). Default spawn works; MiaAI's compose doesn't set it.
+  TORCH_CUDA_ARCH_LIST: 12.1a
+  FLASHINFER_CUDA_ARCH_LIST: 12.1a
+  NCCL_NET: IB
+  NCCL_IB_DISABLE: "0"
+  NCCL_IB_GID_INDEX: "3"
+  NCCL_CROSS_NIC: "1"
+  NCCL_CUMEM_ENABLE: "0"
+  NCCL_IGNORE_CPU_AFFINITY: "1"
+  NCCL_NVLS_ENABLE: "0"
+  NCCL_DEBUG: WARN
+
+# Serve command (MiaAI's compose serve, adapted to sparkrun placeholders —
+# multi-node flags and executor backend injected by sparkrun, as usual).
+# MiaAI passes --override-generation-config '{"temperature":0.6,"top_p":0.95}'
+# for this lane; safe here because there is no repetition_penalty in it (that
+# was the dspark-lane crash risk).
+command: |
+  vllm serve {model} \
+      --served-model-name {served_model_name} \
+      --host {host} \
+      --port {port} \
+      --trust-remote-code \
+      --tensor-parallel-size {tensor_parallel} \
+      --pipeline-parallel-size {pipeline_parallel} \
+      --kv-cache-dtype {kv_cache_dtype} \
+      --block-size {block_size} \
+      --max-model-len {max_model_len} \
+      --max-num-seqs {max_num_seqs} \
+      --max-num-batched-tokens {max_num_batched_tokens} \
+      --gpu-memory-utilization {gpu_memory_utilization} \
+      --enable-prefix-caching \
+      --enable-chunked-prefill \
+      --speculative-config '{"method":"mtp","num_speculative_tokens":2}' \
+      --tokenizer-mode deepseek_v4 \
+      --tool-call-parser deepseek_v4 \
+      --enable-auto-tool-choice \
+      --reasoning-parser deepseek_v4 \
+      --default-chat-template-kwargs '{"thinking":false}' \
+      --override-generation-config '{"temperature":0.6,"top_p":0.95}' \
+      --generation-config vllm
