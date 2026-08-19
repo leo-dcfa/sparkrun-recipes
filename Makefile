@@ -1,17 +1,15 @@
 # Makefile — convenience wrappers around `sparkrun run` for the recipes Leo runs
 # day-to-day on the 2x DGX Spark (GB10) homelab.
 #
-#   make deepseek                         # launch DeepSeek-V4-Flash fp8+MTP, 1M ctx (local, MiaAI main lane)
 #   make minimax                          # launch MiniMax-M2.7 NVFP4 (official)
 #   make hy3                              # launch Hy3-295B NVFP4-W4A16 + MTP (local)
-#   make deepseek-dspark                  # launch DeepSeek-V4-Flash + DSpark drafter, NVFP4 KV, 1M ctx (local)
 #   make deepseek-0731                    # launch DeepSeek-V4-Flash-0731 + DSpark drafter, NVFP4 KV, 1M ctx (local)
 #   make laguna                           # launch Laguna S 2.1 NVFP4 + DFlash drafter, 256K ctx (local, 1-node)
 #   make mimo                             # launch MiMo-V2.5 NVFP4 Omni (multimodal), 1M ctx (local, 2-node)
 #   make inkling                          # launch TML Inkling-Small NVFP4 (multimodal MoE), SGLang+DSpark, 1M ctx (local, 2-node)
 #   make step                             # launch Step-3.7-Flash NVFP4, 256K ctx (local, 2-node)
-#   make deepseek MAX_MODEL_LEN=500000    # override context length
-#   make deepseek-dry                     # VRAM/fit estimate, no launch
+#   make deepseek-0731 MAX_MODEL_LEN=500000  # override context length
+#   make deepseek-0731-dry                # VRAM/fit estimate, no launch
 #   make stop                             # stop everything on the cluster
 #
 # Recipes are registry-qualified (@registry/name); resolved via the enabled
@@ -21,11 +19,9 @@ SPARKRUN ?= sparkrun
 CLUSTER  ?= leo-azl-2node
 
 # Registry-qualified recipe identifiers.
-# DeepSeek main lane — Spark Arena recipe (J C, 37.80 tok/s TG, 256K ctx,
-# scitrera image, 2026-07-23). Replaced @experimental/deepseek4-flash-fp8-mtp-vllm.
-# The MiaAI 1M-ctx variant (verified working, unbenchmarked) remains at
-# recipes/deepseek-v4-flash-1m.yaml — swap the variable to use it.
-DEEPSEEK_RECIPE       := recipes/deepseek-v4-flash.yaml
+# (Pre-0731 DeepSeek lanes retired 2026-08-19 — `make deepseek` arena recipe and
+#  `make deepseek-dspark` + its MiaAI compose fallback; 0731 is the only DeepSeek
+#  lane now. Recipes archived in git history.)
 MINIMAX_RECIPE        := @official/minimax-m2.7-nvfp4-vllm
 # (MiniMax-M3 REAP25 retired 2026-07-24 — was @experimental/minimax-m3-v0-nvfp4-2x-reap25.)
 # (Spark Qwen lanes retired 2026-07-24 — were @official/qwen3.6-27b-fp8-mtp-vllm
@@ -33,14 +29,6 @@ MINIMAX_RECIPE        := @official/minimax-m2.7-nvfp4-vllm
 
 # Local recipes (this repo) — run by file path, no registry needed.
 HY3_RECIPE            := recipes/hy3-295b-nvfp4.yaml
-# DeepSeek-V4-Flash + DSpark drafter — Spark Arena recipe (J C, 49.56 tok/s TG,
-# 384K ctx, fp8 KV, production-3.7 image, 2026-07-23). Two earlier attempts at
-# this lane failed the same day (tonyd Stage-C build; a hand-port of MiaAI's
-# Anemll compose that garbled under sparkrun) — deploy/deepseek-dspark/ keeps
-# the MiaAI compose deployment as a fallback (own start/stop scripts, do not
-# launch via sparkrun).
-DEEPSEEK_DSPARK_RECIPE := recipes/deepseek-v4-flash-dspark.yaml
-DSPARK_DEPLOY_DIR      := deploy/deepseek-dspark
 # DeepSeek-V4-Flash-0731 (official release) + DSpark drafter — tonyd2wild's
 # forum lane (55.4 tok/s mean TG, 78.4 peak, 1M ctx, NVFP4 KV; adopted
 # 2026-08-01). Runs the Patch-4 committed image
@@ -84,9 +72,9 @@ endif
 
 RUN := $(SPARKRUN) run --cluster $(CLUSTER)
 
-.PHONY: help deepseek minimax hy3 deepseek-dspark deepseek-dspark-compose deepseek-0731 laguna laguna-fp8 mimo inkling inkling-eugr step \
-        deepseek-dry minimax-dry hy3-dry deepseek-dspark-dry deepseek-0731-dry laguna-dry laguna-fp8-dry mimo-dry inkling-dry step-dry \
-        stop stop-deepseek stop-minimax stop-hy3 stop-deepseek-dspark stop-deepseek-0731 stop-laguna stop-laguna-fp8 stop-mimo stop-inkling stop-step \
+.PHONY: help minimax hy3 deepseek-0731 laguna laguna-fp8 mimo inkling inkling-eugr step \
+        minimax-dry hy3-dry deepseek-0731-dry laguna-dry laguna-fp8-dry mimo-dry inkling-dry step-dry \
+        stop stop-minimax stop-hy3 stop-deepseek-0731 stop-laguna stop-laguna-fp8 stop-mimo stop-inkling stop-step \
         status logs list
 
 help: ## Show this help
@@ -95,23 +83,11 @@ help: ## Show this help
 
 ## --- launch ---------------------------------------------------------------
 
-deepseek: ## Launch DeepSeek-V4-Flash fp8+MTP 1M ctx (local, 2-node, MiaAI main lane)
-	$(RUN) $(DEEPSEEK_RECIPE) $(OVERRIDES)
-
 minimax: ## Launch MiniMax-M2.7 NVFP4 (official, 2-node)
 	$(RUN) $(MINIMAX_RECIPE) $(OVERRIDES)
 
 hy3: ## Launch Hy3-295B NVFP4-W4A16 + MTP (local, 2-node)
 	$(RUN) $(HY3_RECIPE) $(OVERRIDES)
-
-deepseek-dspark: ## Launch DeepSeek-V4-Flash + DSpark drafter (arena recipe, 2-node, fp8 KV, 384K ctx)
-	$(RUN) $(DEEPSEEK_DSPARK_RECIPE) $(OVERRIDES)
-
-deepseek-dspark-compose: ## Launch the MiaAI compose fallback for the DSpark lane (worker-first)
-	cd $(DSPARK_DEPLOY_DIR) && PORT=8000 \
-		API_URL=http://127.0.0.1:8000/v1/models \
-		CHAT_URL=http://127.0.0.1:8000/v1/chat/completions \
-		./start-deepseek-v4-flash-dspark.sh
 
 deepseek-0731: ## Launch DeepSeek-V4-Flash-0731 + DSpark drafter (tonyd2wild lane, 2-node, NVFP4 KV, 1M ctx)
 	$(RUN) $(DEEPSEEK_0731_RECIPE) $(OVERRIDES)
@@ -136,17 +112,11 @@ step: ## Launch Step-3.7-Flash NVFP4 (local, 2-node, 256K ctx, MiaAI no-MTP lane
 
 ## --- dry-run / VRAM fit estimate (no launch) ------------------------------
 
-deepseek-dry: ## Estimate VRAM/context fit for DeepSeek
-	$(RUN) $(DEEPSEEK_RECIPE) $(OVERRIDES) --dry-run
-
 minimax-dry: ## Estimate VRAM/context fit for MiniMax-M2.7 NVFP4
 	$(RUN) $(MINIMAX_RECIPE) $(OVERRIDES) --dry-run
 
 hy3-dry: ## Estimate VRAM/context fit for Hy3-295B NVFP4-W4A16
 	$(RUN) $(HY3_RECIPE) $(OVERRIDES) --dry-run
-
-deepseek-dspark-dry: ## Estimate VRAM/context fit for the DSpark arena recipe
-	$(RUN) $(DEEPSEEK_DSPARK_RECIPE) $(OVERRIDES) --dry-run
 
 deepseek-0731-dry: ## Estimate VRAM/context fit for DeepSeek-V4-Flash-0731 + DSpark
 	$(RUN) $(DEEPSEEK_0731_RECIPE) $(OVERRIDES) --dry-run
@@ -168,24 +138,16 @@ step-dry: ## Estimate VRAM/context fit for Step-3.7-Flash NVFP4
 
 ## --- lifecycle ------------------------------------------------------------
 
-stop: ## Stop all workloads on the cluster (sparkrun + dspark compose + inkling eugr lanes)
+stop: ## Stop all workloads on the cluster (sparkrun + inkling eugr lanes)
 	$(SPARKRUN) stop --all --cluster $(CLUSTER)
-	-cd $(DSPARK_DEPLOY_DIR) && ./stop-deepseek-v4-flash-dspark.sh 2>/dev/null
 	-docker stop vllm_node 2>/dev/null
 	-ssh 10.100.200.1 "docker stop vllm_node" 2>/dev/null
-
-stop-deepseek: ## Stop just the DeepSeek workload
-	$(SPARKRUN) stop $(DEEPSEEK_RECIPE) --cluster $(CLUSTER)
 
 stop-minimax: ## Stop just the MiniMax-M2.7 NVFP4 workload
 	$(SPARKRUN) stop $(MINIMAX_RECIPE) --cluster $(CLUSTER)
 
 stop-hy3: ## Stop just the Hy3-295B NVFP4 workload
 	$(SPARKRUN) stop $(HY3_RECIPE) --cluster $(CLUSTER)
-
-stop-deepseek-dspark: ## Stop just the DeepSeek-V4-Flash + DSpark workload (sparkrun + compose fallback)
-	-$(SPARKRUN) stop $(DEEPSEEK_DSPARK_RECIPE) --cluster $(CLUSTER)
-	-cd $(DSPARK_DEPLOY_DIR) && ./stop-deepseek-v4-flash-dspark.sh 2>/dev/null
 
 stop-deepseek-0731: ## Stop just the DeepSeek-V4-Flash-0731 + DSpark workload
 	$(SPARKRUN) stop $(DEEPSEEK_0731_RECIPE) --cluster $(CLUSTER)
