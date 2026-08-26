@@ -1,0 +1,158 @@
+# ===========================================================================
+# STATUS 2026-08-27: THIS LANE DOES NOT SERVE ON GB10. Do not burn an evening
+# on it again until vllm#53906 (glm5_next) lands with sm_121 sparse-MLA support.
+#
+# The wall, in order (each ~13 min to reach, five launches to map):
+#   1. Weights must be host-owned. Downloading them via `docker run ... hf
+#      download` leaves them root-owned and sparkrun's rsync fails rc=23
+#      ("failed to set times"). No passwordless sudo here — fix with a root
+#      container: docker run --rm -v ~/.cache/huggingface:/cache/huggingface
+#      --entrypoint chown <img> -R 1000:1000 /cache/huggingface/hub/models--...
+#   2. gpu_memory_utilization 0.93 is rejected: only ~110.9 of 121.7 GiB is free
+#      at startup. 0.88 works.  [fixed below]
+#   3+4. The 34 KDA linear-attention layers need a 2,170,880 B state page that
+#      must fit inside the attention page. vLLM's auto-sizing lands on 1024
+#      tokens (671,744 B) because it measures a different attention spec. The
+#      MLA group costs 656 B/token, so the block must be >= 3310 tokens; an
+#      explicit --block-size is a floor the auto-logic only raises, so 4096
+#      sticks. With that, KV allocates fine: 594,865 tokens, 36x at 16K ctx.
+#      [fixed below]
+#   5. THE BLOCKER, unreachable from config: on sm_121 the only admissible
+#      sparse-MLA backend is FLASHINFER_MLA_SPARSE_SM120; it raises unless the
+#      KV layout is the packed fp8_ds_mla; that layout hard-codes a 64-value
+#      bf16 RoPE tail ("pe_dim must be 64"); GLM-5.3-Flash has
+#      qk_rope_head_dim = 0, so it can never satisfy it. The sibling backends
+#      are gated to cc major 9 (Hopper) and SM10 (B200/GB200) — exactly the
+#      vendor's verified list, with sm_121 absent.
+#      VLLM_MLA_DISABLE=1 does NOT help: it reaches the container and use_mla
+#      honours it, but it only gates config-level choices while the glm5_next
+#      implementation builds MLA modules unconditionally.
+#
+# Everything else is ready: image pulled and 182 GiB of weights present on both
+# nodes, so `make glm` is one command whenever upstream support arrives.
+# ===========================================================================
+# Recipe: GLM-5.3-Flash NVFP4 (weight-only) — 320B / 18B-active natively-multimodal
+#         MoE, hybrid sparse + linear attention, for DGX Spark GB10, 2 nodes, TP=2.
+# Source: https://huggingface.co/LibertAIDAI/GLM-5.3-Flash-NVFP4  (quant of zai-org/GLM-5.3-Flash)
+#         Base model released 2026-08-26; NVFP4 quant published the same day.
+#
+# Container is the VENDOR per-model image vllm/vllm-openai:glm53-flash-arm64-cu130.
+# This is load-bearing: the `glm5_next` architecture is NOT in vLLM main yet
+# (in-flight as vllm#53906), so none of the homelab's other images — dspark,
+# stepfun37, eugr — can load this checkpoint. Use the arm64-cu130 tag on GB10;
+# the x86_64 tag will not run here.
+#
+# Quantization: NVFP4 weight-only (NVFP4-A16). Routed-expert FFN (97% of params)
+# is 4-bit; both attention flavours (34 KDA linear-attention + 11 DeepSeek-sparse
+# layers incl. the indexer), the whole vision tower, shared experts, routers,
+# dense/MTP MLP, mHC tensors, embeddings, lm_head and norms stay BF16.
+# 598.5 GiB BF16 -> ~181 GiB, which is what makes it fit on two GB10 desktops.
+#
+# --moe-backend marlin + --enforce-eager are load-bearing on sm_121, same as the
+# hy3-295b lane: the native FP4 MoE kernels raise cudaErrorNoKernelImageForDevice
+# on GB10 (the vendor verifies H100/B200/GB200 only, NOT sm_121), and the model
+# card names marlin (dequant-to-FP16) as the known-good fallback.
+#
+# Parsers per the model card: --tool-call-parser glm47, --reasoning-parser glm45.
+#
+# NO --distributed-executor-backend / --nnodes / --node-rank here: sparkrun's
+# vllm-distributed runtime injects the native multi-node launch flags itself
+# (see the hy3-295b recipe header for the full rationale).
+recipe_version: "1"
+name: GLM-5.3-Flash-NVFP4
+model: LibertAIDAI/GLM-5.3-Flash-NVFP4
+runtime: vllm-distributed
+min_nodes: 2
+cluster_only: true
+container: vllm/vllm-openai:glm53-flash-arm64-cu130
+executor_config:
+  entrypoint: ""
+metadata:
+  description: GLM-5.3-Flash NVFP4 (320B/18B-active multimodal MoE) on 2x DGX Spark GB10, TP=2, 128K ctx
+  maintainer: local (leo)
+  source: https://huggingface.co/LibertAIDAI/GLM-5.3-Flash-NVFP4
+  base_model: zai-org/GLM-5.3-Flash
+  model_dtype: nvfp4
+  kv_cache: auto
+  vllm_version: "vllm/vllm-openai:glm53-flash-arm64-cu130 (vendor per-model image)"
+defaults:
+  host: 0.0.0.0
+  port: 8000
+  served_model_name: glm-5.3-flash
+  tensor_parallel: 2
+  pipeline_parallel: 1
+  gpu_memory_utilization: 0.88
+  # MLA-DISABLED LANE (2026-08-27). The model ceiling is 1M, but see the
+  # VLLM_MLA_DISABLE note below: with MLA off the 11 sparse-attention layers store
+  # full per-head K/V (11 x 64 heads x 512 dims x 2B = ~0.72 MB/token), so KV alone
+  # is ~11.8 GB at 16K. Budget: only ~110.9 of the 121.7 GiB is free at startup
+  # (the rest is system), so 0.88 -> ~107 GB, minus 90.65 GB of weights leaves
+  # ~16 GB for KV + activations. 0.93 was rejected outright by vLLM as
+  # unsatisfiable against free memory.
+  max_model_len: 16384
+  max_num_seqs: 1
+  max_num_batched_tokens: 2048
+  kv_cache_dtype: auto
+  load_format: auto
+  # The 34 KDA linear-attention layers need a 2,170,880-byte state page, and the
+  # hybrid allocator requires it to fit inside the attention page. vLLM's own
+  # auto-sizing (platforms/interface.py, mamba_cache_mode == "all") sizes the block
+  # from a different attention spec and lands on 1024 tokens, giving a 671,744-byte
+  # MLA page, so engine init dies with "the mamba state page (2170880 bytes) does
+  # not fit the MLA page (671744 bytes)". The MLA group costs 656 B/token, so the
+  # page needs >= 2170880/656 = 3310 tokens. An explicit --block-size is a floor
+  # the auto-logic only ever raises, so 4096 (-> 2,686,976 B) sticks and clears it.
+  block_size: 4096
+env:
+  # VLLM_MLA_DISABLE is load-bearing on GB10 and is the whole reason this lane
+  # exists. With MLA enabled vLLM picks FLASHINFER_MLA_SPARSE_SM120 (the only
+  # sparse-MLA backend that admits sm_121), that backend demands the packed
+  # fp8_ds_mla KV layout, and fp8_ds_mla asserts pe_dim == 64 — but GLM-5.3-Flash
+  # has qk_rope_head_dim = 0, so engine init dies with
+  #   "concat_and_cache_mla ... pe_dim must be 64 for fp8_ds_mla".
+  # The other sparse backends are gated to cc major 9 (Hopper) / SM10 (B200,GB200).
+  # Turning MLA off trades that dead end for a much larger KV footprint.
+  VLLM_MLA_DISABLE: 1
+  # 320B MoE init is slow and marlin repacks the expert weights on load.
+  VLLM_ENGINE_READY_TIMEOUT_S: "5400"
+  HF_HUB_DISABLE_XET: '1'
+  PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+  TRITON_CACHE_DIR: /cache/huggingface/jitcache/triton
+  TORCH_EXTENSIONS_DIR: /cache/huggingface/jitcache/torch_extensions
+  VLLM_CACHE_DIR: /cache/huggingface/jitcache/vllm
+  FLASHINFER_WORKSPACE_BASE: /cache/huggingface/jitcache/flashinfer
+  XDG_CACHE_HOME: /cache/huggingface/jitcache
+  # CUDA arch (GB10 = sm_121a / Blackwell).
+  CUTE_DSL_ARCH: sm_121a
+  TORCH_CUDA_ARCH_LIST: 12.1a
+  FLASHINFER_CUDA_ARCH_LIST: 12.1a
+  # NCCL over the ConnectX-7 link between the two Sparks (homelab standard).
+  NCCL_NET: IB
+  NCCL_IB_DISABLE: 0
+  NCCL_IB_GID_INDEX: 3
+  NCCL_CROSS_NIC: 1
+  NCCL_CUMEM_ENABLE: 0
+  NCCL_IGNORE_CPU_AFFINITY: 1
+  NCCL_DEBUG: WARN
+command: |
+  vllm serve {model} \
+      --served-model-name {served_model_name} \
+      --host {host} \
+      --port {port} \
+      --trust-remote-code \
+      --tensor-parallel-size {tensor_parallel} \
+      --pipeline-parallel-size {pipeline_parallel} \
+      --moe-backend marlin \
+      --enforce-eager \
+      --load-format {load_format} \
+      --dtype auto \
+      --max-model-len {max_model_len} \
+      --max-num-seqs {max_num_seqs} \
+      --max-num-batched-tokens {max_num_batched_tokens} \
+      --kv-cache-dtype {kv_cache_dtype} \
+      --block-size {block_size} \
+      --gpu-memory-utilization {gpu_memory_utilization} \
+      --enable-prefix-caching \
+      --enable-auto-tool-choice \
+      --tool-call-parser glm47 \
+      --reasoning-parser glm45
