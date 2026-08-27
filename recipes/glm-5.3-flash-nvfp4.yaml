@@ -1,35 +1,49 @@
 # ===========================================================================
-# STATUS 2026-08-27: THIS LANE DOES NOT SERVE ON GB10. Do not burn an evening
-# on it again until vllm#53906 (glm5_next) lands with sm_121 sparse-MLA support.
+# STATUS 2026-08-27: does not serve with the VENDOR image. The blocker is the
+# RUNTIME, not the hardware — this exact quant is reported working on 2x DGX
+# Spark at 23.08 tok/s / 200k ctx:
+#   forums.developer.nvidia.com/t/glm-5-3-flash-320b-total-parameters-18b-active/381350/22
+# That poster runs vLLM with a "native SM12x extension"; the settings below are
+# copied from their measured configuration. What we lack is only that extension.
 #
-# The wall, in order (each ~13 min to reach, five launches to map):
-#   1. Weights must be host-owned. Downloading them via `docker run ... hf
-#      download` leaves them root-owned and sparkrun's rsync fails rc=23
-#      ("failed to set times"). No passwordless sudo here — fix with a root
-#      container: docker run --rm -v ~/.cache/huggingface:/cache/huggingface
-#      --entrypoint chown <img> -R 1000:1000 /cache/huggingface/hub/models--...
-#   2. gpu_memory_utilization 0.93 is rejected: only ~110.9 of 121.7 GiB is free
-#      at startup. 0.88 works.  [fixed below]
-#   3+4. The 34 KDA linear-attention layers need a 2,170,880 B state page that
-#      must fit inside the attention page. vLLM's auto-sizing lands on 1024
-#      tokens (671,744 B) because it measures a different attention spec. The
-#      MLA group costs 656 B/token, so the block must be >= 3310 tokens; an
-#      explicit --block-size is a floor the auto-logic only raises, so 4096
-#      sticks. With that, KV allocates fine: 594,865 tokens, 36x at 16K ctx.
-#      [fixed below]
-#   5. THE BLOCKER, unreachable from config: on sm_121 the only admissible
-#      sparse-MLA backend is FLASHINFER_MLA_SPARSE_SM120; it raises unless the
-#      KV layout is the packed fp8_ds_mla; that layout hard-codes a 64-value
-#      bf16 RoPE tail ("pe_dim must be 64"); GLM-5.3-Flash has
-#      qk_rope_head_dim = 0, so it can never satisfy it. The sibling backends
-#      are gated to cc major 9 (Hopper) and SM10 (B200/GB200) — exactly the
-#      vendor's verified list, with sm_121 absent.
-#      VLLM_MLA_DISABLE=1 does NOT help: it reaches the container and use_mla
-#      honours it, but it only gates config-level choices while the glm5_next
-#      implementation builds MLA modules unconditionally.
+# Why the vendor image cannot do it:
+#   On sm_121 the only admissible sparse-MLA backend is
+#   FLASHINFER_MLA_SPARSE_SM120. It raises unless kv_cache_dtype is the packed
+#   fp8_ds_mla, and _canonicalize_sparse_mla_kv_cache_dtype maps auto/fp8/
+#   fp8_e4m3 to it. fp8_ds_mla's layout hard-codes a 64-value bf16 RoPE tail
+#   ("pe_dim must be 64"), but GLM-5.3-Flash is NoPE MLA: qk_rope_head_dim = 0
+#   in BOTH the base model and this quant. The image's CacheDType Literal has no
+#   compact-KV/nvfp4_ds_mla option to escape to, and the sibling backends are
+#   gated to cc major 9 (Hopper) and SM10 (B200/GB200).
+#   VLLM_MLA_DISABLE does NOT help: it reaches the container and use_mla honours
+#   it, but it only gates config-level choices while vllm/models/glm5next (the
+#   sole implementation, NVIDIA subtree) builds MLA modules regardless.
+#   Upstream gap: vllm#45317. jasl's SM12x sparse-MLA work (vllm#41834) is wired
+#   for DeepSeek-V4-Flash only — which is exactly why the ds4 lane runs here and
+#   this one does not.
 #
-# Everything else is ready: image pulled and 182 GiB of weights present on both
-# nodes, so `make glm` is one command whenever upstream support arrives.
+# The port that would fix it: ~/dspark-nvfp4-build/patches/
+# official-main-b12x-nvfp4-python.patch is the DS4 equivalent — pure Python, no
+# CUDA, touching vllm/models/deepseek_v4/{attention,sparse_mla}.py plus the
+# flashmla_sparse backend and kv_cache_interface. The GLM analogue would wire
+# vllm/models/glm5next/nvidia/attention.py (it already has get_attn_backend ->
+# KpoolTailBackend and ops/kpool_compress.py) through the same SM12x sparse-MLA
+# path, handling pe_dim = 0.
+#
+# Already solved and kept below, so a future attempt starts here:
+#   - Weights must be host-owned; downloading via `docker run ... hf download`
+#     leaves them root-owned and sparkrun's rsync fails rc=23. No passwordless
+#     sudo here, so fix with a root container:
+#       docker run --rm -v ~/.cache/huggingface:/cache/huggingface \
+#         --entrypoint chown <img> -R 1000:1000 /cache/huggingface/hub/models--...
+#   - gpu_memory_utilization 0.93 is rejected outright (only ~110.9 of 121.7 GiB
+#     free at startup). The forum lane uses 0.90.
+#   - The 34 KDA layers need a 2,170,880 B state page that must fit inside the
+#     attention page. vLLM's auto-sizing lands on 1024 tokens (671,744 B) because
+#     it measures a different attention spec; the MLA group costs 656 B/token, so
+#     the block must be >= 3310. An explicit --block-size is a floor the
+#     auto-logic only raises, so 4096 sticks. KV then allocates cleanly.
+#   - Image and 182 GiB of weights are present on both nodes.
 # ===========================================================================
 # Recipe: GLM-5.3-Flash NVFP4 (weight-only) — 320B / 18B-active natively-multimodal
 #         MoE, hybrid sparse + linear attention, for DGX Spark GB10, 2 nodes, TP=2.
@@ -81,16 +95,15 @@ defaults:
   served_model_name: glm-5.3-flash
   tensor_parallel: 2
   pipeline_parallel: 1
-  gpu_memory_utilization: 0.88
-  # MLA-DISABLED LANE (2026-08-27). Model ceiling is 1M. 262144 is set from a
-  # MEASURED figure, not an estimate: at gpu_memory_utilization 0.88 with
-  # block_size 4096 the engine allocated "GPU KV cache size: 594,865 tokens" and
-  # reported 36.31x concurrency for a 16,384-token request. So KV holds ~595K
-  # tokens and 256K leaves ~2.3x headroom with max_num_seqs 1. (An earlier 16384
-  # here came from a hand estimate of ~720 KB/token for the MLA-off path; the real
-  # cost is ~656 B/token, so that setting was ~1000x too conservative.)
-  max_model_len: 262144
-  max_num_seqs: 1
+  gpu_memory_utilization: 0.90
+  # Settings below mirror the working 2x DGX Spark configuration reported in
+  # forums.developer.nvidia.com/t/glm-5-3-flash-320b-total-parameters-18b-active/381350/22
+  # (same LibertAIDAI quant): TP=2, 200,000-token limit, util 0.90, 2,048-token
+  # prefill batches, marlin routed-MoE, FP8 MLA KV, MTP=5 -> 23.08 tok/s c1 /
+  # 60.68 tok/s at c5, with an actual 180,013-token prompt completing. Their KV
+  # report: 848,717 logical token slots with MTP=5 (4.24x 200k), 1,385,714 without.
+  max_model_len: 200000
+  max_num_seqs: 5
   max_num_batched_tokens: 2048
   kv_cache_dtype: auto
   load_format: auto
@@ -103,6 +116,11 @@ defaults:
   # page needs >= 2170880/656 = 3310 tokens. An explicit --block-size is a floor
   # the auto-logic only ever raises, so 4096 (-> 2,686,976 B) sticks and clears it.
   block_size: 4096
+  # MTP=5 per the forum lane: +190% c1 throughput, at the cost of KV headroom.
+  # Drop this for the long-context profile (1,385,714 slots instead of 848,717).
+  speculative_config: '{"method":"mtp","num_speculative_tokens":5}'
+  # Without these, image requests fail with "At most 0 image(s)".
+  limit_mm_per_prompt: '{"image":8,"video":1}'
 env:
   # VLLM_MLA_DISABLE is load-bearing on GB10 and is the whole reason this lane
   # exists. With MLA enabled vLLM picks FLASHINFER_MLA_SPARSE_SM120 (the only
@@ -153,6 +171,9 @@ command: |
       --block-size {block_size} \
       --gpu-memory-utilization {gpu_memory_utilization} \
       --enable-prefix-caching \
+      --speculative-config '{speculative_config}' \
+      --limit-mm-per-prompt '{limit_mm_per_prompt}' \
+      --mm-processor-cache-type lru \
       --enable-auto-tool-choice \
       --tool-call-parser glm47 \
       --reasoning-parser glm45
