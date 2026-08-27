@@ -86,6 +86,10 @@ defaults:
 # convention (build-time) and the NCCL block is the homelab's standard IB tuning
 # (the forum recipe specified ray + CX-7 MTU 9000 but no explicit NCCL knobs).
 env:
+  # Engine-ready timeout raised from the vLLM default 600s: cold-cache 2-node
+  # loads (hy3 took 868s on 2026-08-15) outlive the default and cascade into
+  # shm/NCCL "cancelled" crashes at load completion.
+  VLLM_ENGINE_READY_TIMEOUT_S: "5400"
   # Worker spawn method. The headless peer (node_rank 1) worker crashes at startup
   # under vLLM's default `spawn` with a multiprocessing semaphore restore error
   # (synchronize.py __setstate__ -> FileNotFoundError on /dev/shm/mp-*), which hangs

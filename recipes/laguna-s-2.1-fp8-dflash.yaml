@@ -1,0 +1,104 @@
+# Recipe: Laguna S 2.1 FP8 + DFlash speculative decoding — 2x GB10, TP=2
+# Source: same lineage as laguna-s-2.1-dflash.yaml (the single-node NVFP4 lane,
+#         verified 2026-07-23); this is the higher-fidelity FP8 variant.
+# Card:   https://huggingface.co/poolside/Laguna-S-2.1-FP8
+#
+# FP8 weights are ~121.6 GB — they do NOT fit one GB10 (97 GB budget at
+# GMU 0.80), hence cross-node TP=2 (~61 GB/node + 2.2 GB drafter). Higher
+# quant fidelity than the NVFP4 lane at the cost of occupying BOTH Sparks and
+# per-layer cross-node all-reduce. Keep the NVFP4 lane (`make laguna`) as the
+# daily driver; this is the quality-headroom option.
+#
+# PRE-DOWNLOAD REQUIRED (same sparkrun HF-offline gotcha as the NVFP4 lane):
+# the drafter must be in the HF cache on BOTH nodes before first launch:
+#   ~/.local/share/uv/tools/sparkrun/bin/python3 -c \
+#     "from huggingface_hub import snapshot_download; snapshot_download('poolside/Laguna-S-2.1-DFlash-FP8')"
+# (sparkrun distributes the main model itself.) No HF_TOKEN in env — sparkrun
+# does not interpolate ${VARS}.
+
+# NB 2026-07-24: nightly-20260722 had a BROKEN DFlash path (0% draft acceptance
+# -> pure overhead, ~6 tok/s); 20260723 fixes it (~35% acceptance, 27-35 tok/s
+# warm on NVFP4). First request after each container start is slow (lazy JIT).
+
+recipe_version: "1"
+name: Laguna-S-2.1-FP8-DFlash
+model: poolside/Laguna-S-2.1-FP8
+runtime: vllm-distributed
+min_nodes: 2
+
+# Requires two Sparks (1 GB10 each -> tensor_parallel 2). Will not run solo.
+cluster_only: true
+
+# Same pinned eugr nightly as the NVFP4 lane (laguna_dflash + poolside_v1
+# parsers verified present 2026-07-23). FP8 path is standard vLLM.
+container: eugr/spark-vllm:nightly-20260723
+
+metadata:
+  description: Laguna S 2.1 FP8 + official DFlash drafter on 2x GB10, TP=2, 256K ctx, poolside_v1 parsers
+  maintainer: poolside checkpoint; recipe local (Leo), derived from the verified NVFP4 lane
+  source: https://huggingface.co/poolside/Laguna-S-2.1-FP8
+  base_model: poolside/Laguna-S-2.1
+  model_dtype: fp8
+  draft_method: dflash
+  draft_model: poolside/Laguna-S-2.1-DFlash-FP8
+  vllm_version: "vllm main d20260722 (eugr nightly)"
+
+# Defaults — override on the CLI with -o key=value or the dedicated flags.
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  served_model_name: laguna-s-2.1-fp8
+  tensor_parallel: 2
+  pipeline_parallel: 1
+  # Homelab earlyoom convention; ~61 GB/node weights leaves ample KV at 0.80.
+  gpu_memory_utilization: 0.80
+  # Native max for this checkpoint (same 256K family ceiling as NVFP4).
+  max_model_len: 262144
+  # Same validated GB10 DFlash values as the NVFP4 lane (card's "32" is wrong;
+  # 4 is the single-user safe point — see laguna-s-2.1-dflash.yaml).
+  max_num_seqs: 4
+  max_num_batched_tokens: 8192
+  # num_speculative_tokens (7) and the drafter repo id live inside the literal
+  # JSON --speculative-config blob below (sparkrun v1 brace gotcha).
+
+# Environment variables (mirrors the NVFP4 lane + the standard homelab 2-node
+# NCCL block, which is exercised here since this lane is TP=2).
+env:
+  CUTE_DSL_ARCH: sm_121a
+  MAX_JOBS: 4
+  NVCC_THREADS: 2
+  FLASHINFER_NVCC_THREADS: 2
+  TORCH_CUDA_ARCH_LIST: 12.1a
+  FLASHINFER_CUDA_ARCH_LIST: 12.1a
+  # Headless peer worker crash-avoidance at TP=2 (same as hy3/mimo-dflash).
+  VLLM_WORKER_MULTIPROC_METHOD: fork
+  NCCL_NET: IB
+  NCCL_IB_DISABLE: "0"
+  NCCL_IB_GID_INDEX: "3"
+  NCCL_CROSS_NIC: "1"
+  NCCL_CUMEM_ENABLE: "0"
+  NCCL_IGNORE_CPU_AFFINITY: "1"
+  NCCL_NVLS_ENABLE: "0"
+  NCCL_DEBUG: WARN
+
+# Serve command — identical to the verified NVFP4 lane except model/drafter.
+command: |
+  vllm serve {model} \
+      --served-model-name {served_model_name} \
+      --host {host} \
+      --port {port} \
+      --trust-remote-code \
+      --tensor-parallel-size {tensor_parallel} \
+      --pipeline-parallel-size {pipeline_parallel} \
+      --attention-backend FLASHINFER \
+      --max-model-len {max_model_len} \
+      --max-num-seqs {max_num_seqs} \
+      --max-num-batched-tokens {max_num_batched_tokens} \
+      --gpu-memory-utilization {gpu_memory_utilization} \
+      --speculative-config '{"method":"dflash","model":"poolside/Laguna-S-2.1-DFlash-FP8","num_speculative_tokens":7}' \
+      --override-generation-config '{"temperature":0.7,"top_p":0.95}' \
+      --enable-prefix-caching \
+      --enable-chunked-prefill \
+      --enable-auto-tool-choice \
+      --tool-call-parser poolside_v1 \
+      --reasoning-parser poolside_v1

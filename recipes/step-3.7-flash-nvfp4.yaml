@@ -77,6 +77,10 @@ defaults:
   reasoning_parser: step3p5
 
 env:
+  # Engine-ready timeout raised from the vLLM default 600s: cold-cache 2-node
+  # loads (hy3 took 868s on 2026-08-15) outlive the default and cascade into
+  # shm/NCCL "cancelled" crashes at load completion.
+  VLLM_ENGINE_READY_TIMEOUT_S: "5400"
   # Mirrors recipes/step-3.7-flash-nvfp4.env — keep the two in sync.
   PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
   # Homelab NCCL RoCE set (CX-7 direct link) — same block as the DeepSeek

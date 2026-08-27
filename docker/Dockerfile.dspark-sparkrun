@@ -1,0 +1,11 @@
+# Anemll DSpark GX10 image, adapted for sparkrun.
+# Upstream sets ENTRYPOINT ["vllm","serve"] (their compose passes bare args),
+# but sparkrun launches containers with its own shell bootstrap — under that
+# entrypoint the bootstrap becomes vllm arguments and serve dies with
+# "Invalid JSON: ... input_value=printf %s ...". Diagnosed 2026-07-23.
+# Reset to a neutral entrypoint like every other sparkrun-compatible image.
+# Build on BOTH nodes:
+#   docker build -f docker/Dockerfile.dspark-sparkrun -t dspark-vllm-gx10:sparkrun ~/sparkrun-recipes/docker
+FROM ghcr.io/anemll/dspark-vllm-gx10:0.1.1
+ENTRYPOINT []
+CMD ["sleep","infinity"]

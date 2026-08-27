@@ -1,0 +1,16 @@
+# tonyd2wild Stage-C DSpark image + Patch 4 + procps, for the 0731 lane.
+#
+# - Patch 4 (recipes/mods/patch4_dspark_shared_experts.py): restores the DSpark
+#   draft shared-expert gate_up_proj w1/w3 weight mappings; without it draft
+#   acceptance collapses ~60% -> ~26% on DeepSeek-V4-Flash-0731 weights.
+# - procps: sparkrun's vllm-distributed liveness check needs `ps`; images
+#   without it are declared "exited immediately" on every serve (the same
+#   gotcha as docker/Dockerfile.ds4-procps, diagnosed 2026-07-23).
+#
+# Build on BOTH nodes (context = ~/sparkrun-recipes):
+#   docker build -f docker/Dockerfile.dspark-0731-p4 \
+#     -t vllm-dspark-runtime:dspark-nvfp4-stage-c-p4 ~/sparkrun-recipes
+FROM vllm-dspark-runtime:dspark-nvfp4-stage-c
+COPY recipes/mods/patch4_dspark_shared_experts.py /tmp/p4.py
+RUN /opt/env/bin/python /tmp/p4.py && rm /tmp/p4.py
+RUN apt-get update && apt-get install -y --no-install-recommends procps && rm -rf /var/lib/apt/lists/*

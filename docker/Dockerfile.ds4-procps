@@ -1,0 +1,8 @@
+# aidendle94s DS4 GB10 image + procps.
+# sparkrun's vllm-distributed liveness check needs `ps`; the upstream image
+# ships without it, so every serve is declared "exited immediately" and the
+# worker node never launches (head then times out at c10d rendezvous with
+# "1/2 clients joined"). Diagnosed 2026-07-23. Build on BOTH nodes:
+#   docker build -f docker/Dockerfile.ds4-procps -t sparkrun-vllm-ds4-gb10:procps ~/sparkrun-recipes/docker
+FROM aidendle94/sparkrun-vllm-ds4-gb10:production-ready
+RUN apt-get update && apt-get install -y --no-install-recommends procps && rm -rf /var/lib/apt/lists/*

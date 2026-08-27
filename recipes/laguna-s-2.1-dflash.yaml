@@ -1,0 +1,147 @@
+# Recipe: Laguna S 2.1 NVFP4 + DFlash speculative decoding — single GB10
+# Source: https://github.com/MiaAI-Lab/Laguna-S-2.1-DGX-Spark-RTX-6000-PRO (validated GB10 deploy)
+# Card:   https://huggingface.co/poolside/Laguna-S-2.1-NVFP4
+# Blog:   https://poolside.ai/blog/introducing-laguna-s-2-1
+#
+# NB: serve parameters follow the MiaAI-Lab repo, NOT the model card blurb — the
+# card's "num_speculative_tokens 15 / max-num-seqs 32" reads wrong for GB10;
+# the validated deploy uses 7 / 4 ("DFlash crashes at defaults; 4 is the
+# single-user safe point") and locks --attention-backend FLASHINFER (do NOT
+# add flashinfer_b12x backends here — broken for this model and slower).
+#
+# Poolside Laguna S 2.1 (118B total / ~8B active MoE, 48 layers: 12 global +
+# 36 sliding-window attention), NVFP4 weights (~71 GB) + the official DFlash
+# drafter (poolside/Laguna-S-2.1-DFlash-NVFP4, ~2 GB). Day-one vLLM support:
+# needs the laguna_dflash model class + poolside_v1 tool/reasoning parsers —
+# verified present in the pinned container below (2026-07-23):
+#   python3 -c "from vllm.reasoning import ReasoningParserManager as R; \
+#     assert 'poolside_v1' in R.reasoning_parsers"
+#   (+ vllm/model_executor/models/laguna_dflash.py, vllm/v1/spec_decode/dflash.py)
+#
+# Fits ONE GB10: ~73 GiB weights+drafter against ~97 GiB budget at GMU 0.80,
+# 256K native context. The other Spark can serve something else meanwhile.
+# --tp 2 works if you want both Sparks on it (NCCL env below is the homelab's
+# standard IB tuning).
+#
+# Model card quotes 600-800 tok/s prefill, ~15 tok/s decode on prose with the
+# drafter accepting 2.9-3.1 tokens/step. First startup JITs FlashInfer cute-DSL
+# kernels for ~15 min — MAX_JOBS=4 (env) is REQUIRED to avoid unified-memory
+# exhaustion during that compile. Subsequent starts are fast.
+
+# NB 2026-07-24: nightly-20260722 had a BROKEN DFlash path (0% draft acceptance
+# -> pure overhead, ~6 tok/s); 20260723 fixes it (~35% acceptance, 27-35 tok/s
+# warm on NVFP4). First request after each container start is slow (lazy JIT).
+
+recipe_version: "1"
+name: Laguna-S-2.1-DFlash
+model: poolside/Laguna-S-2.1-NVFP4
+
+# Single GB10 is plenty (see math above) — default TP=1, no cluster requirement.
+
+# Pinned eugr nightly (vLLM main built 2026-07-22) — first eugr image on this
+# host carrying laguna_dflash + poolside_v1. `latest` moves; keep the date tag.
+container: eugr/spark-vllm:nightly-20260723
+
+metadata:
+  description: Laguna S 2.1 NVFP4 + official DFlash drafter on 1x GB10, 256K ctx, poolside_v1 parsers
+  maintainer: poolside checkpoint; recipe local (Leo), serve params from MiaAI-Lab's GB10 deploy
+  source: https://github.com/MiaAI-Lab/Laguna-S-2.1-DGX-Spark-RTX-6000-PRO
+  base_model: poolside/Laguna-S-2.1
+  model_dtype: nvfp4
+  draft_method: dflash
+  draft_model: poolside/Laguna-S-2.1-DFlash-NVFP4
+  vllm_version: "vllm main d20260722 (card says >= 0.25.0; eugr builds report 0.23.1rc1.dev* — go by build date)"
+
+# Defaults — override on the CLI with -o key=value or the dedicated flags.
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  served_model_name: laguna-s-2.1
+  tensor_parallel: 1
+  pipeline_parallel: 1
+  # Card recommends 0.85, but that sits exactly at this homelab's earlyoom
+  # ceiling (see deepseek-dspark README) — 0.80 leaves OS headroom and still
+  # gives ~24 GiB KV over the 73 GiB weights. Raise with -o gpu_memory_utilization=0.85
+  # only if 256K prompts actually hit KV preemption.
+  gpu_memory_utilization: 0.80
+  # Native max for this checkpoint (card). The bf16 release advertises 1M but
+  # this NVFP4 card caps at 256K — don't raise without a YaRN story.
+  max_model_len: 262144
+  # MiaAI-Lab: REQUIRED — DFlash crashes at vLLM's default; 4 is the validated
+  # single-user safe point on GB10. Do not raise casually.
+  max_num_seqs: 4
+  max_num_batched_tokens: 8192
+  # num_speculative_tokens (7) and the drafter repo id are NOT substitutable
+  # defaults — they live inside the literal JSON --speculative-config blob in
+  # the command below (sparkrun 0.2.x doesn't substitute {placeholders} nested
+  # inside literal braces; same gotcha as hy3/deepseek-dspark).
+
+# PRE-DOWNLOAD REQUIRED: sparkrun containers run with HF offline mode — only
+# the `model:` repo is pre-fetched by sparkrun into the mounted host cache
+# (~/.cache/huggingface). The DFlash drafter referenced in --speculative-config
+# is NOT, so fetch it on the host once before first launch:
+#   ~/.local/share/uv/tools/sparkrun/bin/python3 -c \
+#     "from huggingface_hub import snapshot_download; snapshot_download('poolside/Laguna-S-2.1-DFlash-NVFP4')"
+# (~2 GB). Without this, vLLM dies at startup with "Invalid repository ID or
+# local directory specified: 'poolside/Laguna-S-2.1-DFlash-NVFP4'".
+#
+# NB: do NOT put HF_TOKEN: "${HF_TOKEN}" here — sparkrun does not interpolate
+# env values, the literal string becomes a poisoned auth header. (The
+# deepseek-dspark recipe carries that pattern; it works there only because
+# everything it needs is pre-cached.)
+
+# Environment variables (kept in sync with laguna-s-2.1-dflash.env).
+env:
+  # Engine-ready timeout raised from the vLLM default 600s: cold-cache 2-node
+  # loads (hy3 took 868s on 2026-08-15) outlive the default and cascade into
+  # shm/NCCL "cancelled" crashes at load completion.
+  VLLM_ENGINE_READY_TIMEOUT_S: "5400"
+  # MiaAI-Lab GB10 deploy: target the cute-DSL kernels at GB10 (sm_121a).
+  CUTE_DSL_ARCH: sm_121a
+  # Cap JIT parallelism or the ~15 min first-start compile OOMs unified memory.
+  # If it still OOMs: MAX_JOBS=2 / NVCC_THREADS=1.
+  MAX_JOBS: 4
+  NVCC_THREADS: 2
+  FLASHINFER_NVCC_THREADS: 2
+  # CUDA arch (GB10 = sm_121a / Blackwell) — repo convention, matters at build time.
+  TORCH_CUDA_ARCH_LIST: 12.1a
+  FLASHINFER_CUDA_ARCH_LIST: 12.1a
+  # Worker spawn method — same crash-avoidance as the mimo/hy3 recipes (only
+  # bites at TP=2, harmless at TP=1).
+  VLLM_WORKER_MULTIPROC_METHOD: fork
+  # NCCL over the ConnectX-7 IB link — only exercised if you run --tp 2.
+  NCCL_NET: IB
+  NCCL_IB_DISABLE: 0
+  NCCL_IB_GID_INDEX: 3
+  NCCL_CROSS_NIC: 1
+  NCCL_CUMEM_ENABLE: 0
+  NCCL_IGNORE_CPU_AFFINITY: 1
+  NCCL_DEBUG: WARN
+
+# Serve command — MiaAI-Lab's validated GB10 serve, adapted to sparkrun
+# placeholders. The --speculative-config and --override-generation-config JSON
+# blobs are hardcoded (no {placeholders} inside literal braces). Explicit
+# --attention-backend FLASHINFER per the deploy repo (KV auto-selects fp8
+# under it). Do NOT add min_p to the generation config — 400s under spec
+# decode. The drafter repo id resolves from the mounted offline cache — see
+# the PRE-DOWNLOAD note above.
+command: |
+  vllm serve {model} \
+      --served-model-name {served_model_name} \
+      --host {host} \
+      --port {port} \
+      --trust-remote-code \
+      --tensor-parallel-size {tensor_parallel} \
+      --pipeline-parallel-size {pipeline_parallel} \
+      --attention-backend FLASHINFER \
+      --max-model-len {max_model_len} \
+      --max-num-seqs {max_num_seqs} \
+      --max-num-batched-tokens {max_num_batched_tokens} \
+      --gpu-memory-utilization {gpu_memory_utilization} \
+      --speculative-config '{"method":"dflash","model":"poolside/Laguna-S-2.1-DFlash-NVFP4","num_speculative_tokens":7}' \
+      --override-generation-config '{"temperature":0.7,"top_p":0.95}' \
+      --enable-prefix-caching \
+      --enable-chunked-prefill \
+      --enable-auto-tool-choice \
+      --tool-call-parser poolside_v1 \
+      --reasoning-parser poolside_v1
