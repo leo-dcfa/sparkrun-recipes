@@ -82,14 +82,14 @@ defaults:
   tensor_parallel: 2
   pipeline_parallel: 1
   gpu_memory_utilization: 0.88
-  # MLA-DISABLED LANE (2026-08-27). The model ceiling is 1M, but see the
-  # VLLM_MLA_DISABLE note below: with MLA off the 11 sparse-attention layers store
-  # full per-head K/V (11 x 64 heads x 512 dims x 2B = ~0.72 MB/token), so KV alone
-  # is ~11.8 GB at 16K. Budget: only ~110.9 of the 121.7 GiB is free at startup
-  # (the rest is system), so 0.88 -> ~107 GB, minus 90.65 GB of weights leaves
-  # ~16 GB for KV + activations. 0.93 was rejected outright by vLLM as
-  # unsatisfiable against free memory.
-  max_model_len: 16384
+  # MLA-DISABLED LANE (2026-08-27). Model ceiling is 1M. 262144 is set from a
+  # MEASURED figure, not an estimate: at gpu_memory_utilization 0.88 with
+  # block_size 4096 the engine allocated "GPU KV cache size: 594,865 tokens" and
+  # reported 36.31x concurrency for a 16,384-token request. So KV holds ~595K
+  # tokens and 256K leaves ~2.3x headroom with max_num_seqs 1. (An earlier 16384
+  # here came from a hand estimate of ~720 KB/token for the MLA-off path; the real
+  # cost is ~656 B/token, so that setting was ~1000x too conservative.)
+  max_model_len: 262144
   max_num_seqs: 1
   max_num_batched_tokens: 2048
   kv_cache_dtype: auto
