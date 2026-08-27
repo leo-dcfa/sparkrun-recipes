@@ -22,6 +22,24 @@
 #   for DeepSeek-V4-Flash only — which is exactly why the ds4 lane runs here and
 #   this one does not.
 #
+# WHY A PYTHON-ONLY PORT CANNOT DO IT (checked 2026-08-27, vendor image):
+#   The vendor image DOES have the model-owned backend pattern —
+#   models/deepseek_v4/{attention.py,sparse_mla.py,nvidia/flashinfer_sparse.py}
+#   with DeepseekV4FlashInferSM120Attention, a _resolve_dsv4_kv_cache_dtype hook,
+#   and a use_fp8_ds_mla_layout ClassVar that can select plain bf16 KV rows. So
+#   mirroring it for glm5next looked like pure wiring. It is not, because of page
+#   geometry:
+#     fp8_ds_mla page = 584 B/token = 448 NoPE + 128 RoPE (64 x bf16) + 8 scale,
+#     returned as a literal from get_kv_cache_shape and assumed by the CUDA
+#     kernels (concat_and_cache_mla, csrc/.../cache_kernels.cu:866).
+#     DeepSeek-V4-Flash fits it exactly: latent 448, qk_rope_head_dim 64.
+#     GLM-5.3-Flash needs latent 512 + rope 0. The 512-dim latent does not fit the
+#     448-byte NoPE field, so even padding a fake zero 64-dim RoPE tail (which
+#     would satisfy the pe_dim assert and contribute 0 to the dot product) still
+#     does not fit. The remaining sm_121 sparse path therefore needs kernels that
+#     take (kv_lora_rank=512, rope=0) — CUDA work, not a Python patch. That is
+#     what the forum lane's "native SM12x extension" supplies.
+#
 # The port that would fix it: ~/dspark-nvfp4-build/patches/
 # official-main-b12x-nvfp4-python.patch is the DS4 equivalent — pure Python, no
 # CUDA, touching vllm/models/deepseek_v4/{attention,sparse_mla}.py plus the
