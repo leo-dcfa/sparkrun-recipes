@@ -1,0 +1,20 @@
+# tonyd2wild Stage-C DSpark image + Patch 4 + procps + Patch A, for the 0731 lane.
+#
+# Extends Dockerfile.dspark-0731-p4's image with Patch A from the 2026-08-20
+# tuning campaign (repo commit 0fec808): drafter-PRIVATE cudagraph capture
+# sizes. The fork's proposer shares the target's capture sizes (multiples of
+# 1+k), so a single-stream draft runs padded to the 6-bucket / clipped to 4
+# rows — 20 draft tokens per step instead of 5. Byte-complete replacement of
+# v1/spec_decode/dspark_proposer.py; default-off, activated by
+# VLLM_DSPARK_DRAFT_CAPTURE_SIZES=1 in the recipe env. Measured upstream:
+# +3.0% single-stream battery; with VLLM_DSPARK_FUSED_MARKOV_ARGMAX=1
+# (the E15 STACK winner) +1.8% battery / +5% c4 at gmu 0.78.
+#
+# Build on BOTH nodes (context = ~/sparkrun-recipes):
+#   docker build -f docker/Dockerfile.dspark-0731-p4a \
+#     -t vllm-dspark-runtime:dspark-nvfp4-stage-c-p4a ~/sparkrun-recipes
+FROM vllm-dspark-runtime:dspark-nvfp4-stage-c-p4
+COPY recipes/mods/dspark_proposer_patchA.py /opt/env/lib/python3.12/site-packages/vllm/v1/spec_decode/dspark_proposer.py
+# import-check: fail the build, not the first boot, if the replacement is broken
+RUN /opt/env/bin/python -c "import ast,sys; ast.parse(open('/opt/env/lib/python3.12/site-packages/vllm/v1/spec_decode/dspark_proposer.py').read())" \
+    && grep -q VLLM_DSPARK_DRAFT_CAPTURE_SIZES /opt/env/lib/python3.12/site-packages/vllm/v1/spec_decode/dspark_proposer.py

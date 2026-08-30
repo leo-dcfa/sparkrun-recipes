@@ -23,19 +23,36 @@
 # Parsers: deepseek_v4 tool/reasoning parsers are registered in the Stage-C image
 # (verified 2026-08-01); forum default runs thinking:false — flip
 # chat_template_kwargs to '{"thinking":true}' for reasoning traces.
+#
+# 2026-08-29 — adopted the E15 STACK winner from tonyd2wild's 2026-08-20 tuning
+# campaign (repo commit 0fec808, benchmarks/campaign-2026-08-20/):
+#   * k: 3 -> 5 (the Aug-5 upstream correction; k=5 is ~24% over k=3, and their
+#     E2b re-test shows k=4 LOSES 6% — k=5 or nothing)
+#   * gmu 0.80 -> 0.78 (issue #8: spec-decode buffers allocate on the first
+#     real request; 0.80 boots + smokes clean, then dies under traffic)
+#   * max_cudagraph_capture_size REMOVED (upstream PR #5: stale literal
+#     silently truncates capture under concurrency; vLLM derives
+#     max_num_seqs x (k+1) itself)
+#   * VLLM_DSPARK_FUSED_MARKOV_ARGMAX=1 (neutral single-stream, +5-14% at c4)
+#   * Patch A via the -p4a image + VLLM_DSPARK_DRAFT_CAPTURE_SIZES=1
+#     (drafter-private cudagraph sizes; +3% single-stream — see
+#     docker/Dockerfile.dspark-0731-p4a)
+# Campaign nulls, so nobody re-tries them: dual-HCA NCCL (interconnect is NOT
+# the bottleneck), NCCL_PROTO=LL128, B12X mHC/sparse-indexer/compressed-MLA
+# (broken or neutral on this image), draft_sample_method (no-op — drafter
+# always argmaxes; kept in the config as harmless).
 
 model: deepseek-ai/DeepSeek-V4-Flash-0731
-container: vllm-dspark-runtime:dspark-nvfp4-stage-c-p4
+container: vllm-dspark-runtime:dspark-nvfp4-stage-c-p4a
 defaults:
   host: 0.0.0.0
   port: 8000
   served_model_name: deepseek-v4-flash-0731
   tensor_parallel: 2
-  gpu_memory_utilization: 0.80
+  gpu_memory_utilization: 0.78
   max_model_len: 1048576
   max_num_seqs: 6
   max_num_batched_tokens: 8192
-  max_cudagraph_capture_size: 6
   kv_cache_dtype: nvfp4_ds_mla
   block_size: 256
   tool_call_parser: deepseek_v4
@@ -45,7 +62,7 @@ defaults:
   # (seen 2026-08-01 via the LiteLLM /v1/messages path). Same fix as the MiaAI
   # compose lane. Takes effect on next relaunch.
   reasoning_config: '{"reasoning_parser":"deepseek_v4","reasoning_start_str":"<think>","reasoning_end_str":"</think>"}'
-  speculative_config: '{"method":"dspark","num_speculative_tokens":3,"draft_sample_method":"probabilistic"}'
+  speculative_config: '{"method":"dspark","num_speculative_tokens":5,"draft_sample_method":"probabilistic"}'
   chat_template_kwargs: '{"thinking":false}'
 env:
   # Engine-ready timeout raised from the vLLM default 600s: cold-cache 2-node
@@ -72,7 +89,12 @@ env:
   VLLM_DSPARK_CONFIDENCE_SCHEDULER: 'off'
   VLLM_DSPARK_LOCAL_ARGMAX: '1'
   VLLM_DSPARK_REPLICATE_MARKOV_W1: '1'
-  VLLM_DSPARK_FUSED_MARKOV_ARGMAX: '0'
+  # E15 STACK winner pair (2026-08-20 campaign): fused Markov argmax is one
+  # Triton kernel per draft position instead of three (+5-14% at c4), and
+  # DRAFT_CAPTURE_SIZES activates Patch A's drafter-private cudagraph sizes
+  # (+3% single-stream; the env is inert on non-p4a images).
+  VLLM_DSPARK_FUSED_MARKOV_ARGMAX: '1'
+  VLLM_DSPARK_DRAFT_CAPTURE_SIZES: '1'
   VLLM_DSPARK_REFERENCE_KV_QUANT_DEQUANT: '0'
   VLLM_DSV4_B12X_COMPRESSED_MLA: '0'
   VLLM_DSV4_DSPARK_DEFER_TARGET_CAPTURE: '0'
@@ -104,7 +126,6 @@ command: |
     -tp {tensor_parallel} --kv-cache-dtype {kv_cache_dtype} --block-size {block_size} \
     --gpu-memory-utilization {gpu_memory_utilization} --max-model-len {max_model_len} \
     --max-num-seqs {max_num_seqs} --max-num-batched-tokens {max_num_batched_tokens} \
-    --max-cudagraph-capture-size {max_cudagraph_capture_size} \
     --async-scheduling --enable-chunked-prefill --enable-prefix-caching \
     --generation-config vllm \
     --tool-call-parser {tool_call_parser} --reasoning-parser {reasoning_parser} \

@@ -1,0 +1,143 @@
+# ===========================================================================
+# GLM-5.3-Flash NVFP4 + DFlash2 speculative decoding, 2x DGX Spark GB10, TP=2.
+#
+# Supersedes recipes/glm-5.3-flash-nvfp4.yaml (MiaAI v8 image, MTP-4, ~21 tok/s).
+# Source: tonyd2wild/GLM-5.3-Flash-NVFP4-DFlash2-2x-DGX-Spark, adopted 2026-08-30.
+#   Measured there on identical hardware and context:
+#   MTP-4 21.8 tok/s -> DFlash2 46.9 tok/s (2.15x), 74.1% draft acceptance,
+#   ~0 KV cost for the drafter (parasitic slot-sharing with the MLA tensors).
+#
+# WHY THIS IS LOSSLESS: DFlash2 is speculative decoding. The 2.2 GB drafter
+# (incoai/GLM-5.3-Flash-DFlash2) proposes 7 tokens; the full model verifies every
+# one and rejects mismatches. Accepted tokens are bit-identical to what the
+# unspeculated model would have emitted. This buys speed, not accuracy loss.
+#
+# CHECKPOINT CHANGED: RedHatAI/GLM-5.3-Flash-NVFP4 (compressed-tensors) replaces
+# LibertAIDAI/GLM-5.3-Flash-NVFP4 (ModelOpt). The ModelOpt NVFP4 builds emit
+# intermittent corrupted token IDs on GB10 (vLLM #54150) — measured 4/9/8 U+FFFD
+# over three runs vs 0/0/0 for RedHatAI. Nearly invisible in prose, but a bad
+# token inside a tool-call block desyncs the parser and can spiral into a
+# repetition lock. Tradeoff: RedHatAI is W4A4 (activations quantized too) where
+# LibertAIDAI is W4A16 weight-only, so expect a few points lower on hard
+# reasoning — but correct output. Also loads ~2x faster (11 shards vs 120).
+#
+# num_speculative_tokens MUST be 7 = drafter block_size(8) - 1. The drafter is
+# trained for a block of 8 with one position taken by the target's own verified
+# token; asking for 8 drafts a position it never learned.
+#
+# Image glm53-flash-dflash2:v11-local =
+#   ghcr.io/tonyd2wild/vllm-glm53-flash:sm121-v11-dflash2
+#   + the SM121 kpool top-k fix baked in.
+# Upstream bind-mounts that fix; sparkrun recipes cannot express extra volumes,
+# so it is COPYd in instead. Without it the engine dies on any decode past ~24K
+# context. Built on BOTH nodes from ~/build/glm53-dflash2.
+#
+# The drafter is referenced by HF repo id, NOT by container path: sparkrun parses
+# speculative_config.model out of the recipe and runs it through its own model
+# distribution step, which rejects anything that is not a repo id
+# ("Repo id must be in the form repo_name or namespace/repo_name"). It resolves
+# from the HF cache on both nodes, so the repo is pre-pulled there.
+#
+# The multimodal chat template lives under
+# ~/.cache/huggingface/glm53-dflash2/ on both nodes — inside the ONLY directory
+# sparkrun bind-mounts (-> /cache/huggingface), which is why they are staged
+# there rather than in /var/tmp/models as upstream does.
+#
+# VISION: the stock GLM-5.3-Flash chat template is TEXT-ONLY — it renders images
+# as a "you are unable to process this image" reminder string, so no placeholder
+# ever reaches vLLM's multimodal processor and image requests fail with
+# "Failed to apply prompt replacement for mm_items['image'][0]".
+# chat_template_mm.jinja emits the real placeholders
+# (<|begin_of_image|><|image|><|end_of_image|>). The old glm-5.3-flash-nvfp4.yaml
+# lane omitted this, so its advertised vision never actually worked.
+#
+# THINKING STAYS ON, deliberately diverging from upstream's launch script, which
+# bakes enable_thinking:false for +8% draft acceptance. With thinking off GLM
+# emits untagged reasoning prose straight into content — nothing for
+# --reasoning-parser glm45 to split — which breaks agent harnesses. The speed is
+# not worth that here.
+# ===========================================================================
+recipe_version: "1"
+name: GLM-5.3-Flash-NVFP4-DFlash2
+model: RedHatAI/GLM-5.3-Flash-NVFP4
+runtime: vllm-distributed
+min_nodes: 2
+cluster_only: true
+container: glm53-flash-dflash2:v11-local
+executor_config:
+  entrypoint: ""
+metadata:
+  description: GLM-5.3-Flash NVFP4 + DFlash2 k=7 spec decode on 2x DGX Spark GB10, TP=2, 256K ctx, fp8 KV
+  maintainer: local (leo)
+  source: https://github.com/tonyd2wild/GLM-5.3-Flash-NVFP4-DFlash2-2x-DGX-Spark
+  base_model: zai-org/GLM-5.3-Flash
+  model_dtype: nvfp4
+  kv_cache: fp8_e4m3
+  drafter: incoai/GLM-5.3-Flash-DFlash2
+defaults:
+  host: 0.0.0.0
+  port: 8000
+  served_model_name: glm-5.3-flash
+  tensor_parallel: 2
+  pipeline_parallel: 1
+  # 0.85 upstream; 0.78-0.80 starves KV at 131K+, 0.90+ fails the GB10 free-memory check.
+  gpu_memory_utilization: 0.85
+  max_model_len: 262144
+  max_num_seqs: 6
+  kv_cache_dtype: fp8_e4m3
+  # 3 GiB pin (310,292-token pool). Upstream shipped this after a 3-way 20K prefill
+  # at 4.4 GiB drove MemAvailable to 3.06 GB and an anti-OOM watchdog killed the engine.
+  kv_cache_memory: 3221225472
+  # Sized so the KDA linear-attention state page fits the attention page.
+  block_size: 2304
+  speculative_config: '{"method":"dflash","model":"incoai/GLM-5.3-Flash-DFlash2","num_speculative_tokens":7}'
+  limit_mm_per_prompt: '{"image":4,"video":1}'
+  chat_template: /cache/huggingface/glm53-dflash2/chat_template_mm.jinja
+env:
+  VLLM_ENGINE_READY_TIMEOUT_S: "5400"
+  HF_HUB_DISABLE_XET: "1"
+  PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+  TRITON_CACHE_DIR: /cache/huggingface/jitcache/triton
+  TORCH_EXTENSIONS_DIR: /cache/huggingface/jitcache/torch_extensions
+  VLLM_CACHE_DIR: /cache/huggingface/jitcache/vllm
+  FLASHINFER_WORKSPACE_BASE: /cache/huggingface/jitcache/flashinfer
+  XDG_CACHE_HOME: /cache/huggingface/jitcache
+  CUTE_DSL_ARCH: sm_121a
+  TORCH_CUDA_ARCH_LIST: 12.1a
+  FLASHINFER_CUDA_ARCH_LIST: 12.1a
+  FLASHINFER_DISABLE_VERSION_CHECK: "1"
+  NCCL_NET: IB
+  NCCL_IB_DISABLE: 0
+  NCCL_IB_GID_INDEX: 3
+  NCCL_IB_ROCE_VERSION_NUM: 2
+  NCCL_IB_ADDR_FAMILY: AF_INET
+  NCCL_CROSS_NIC: 1
+  NCCL_CUMEM_ENABLE: 0
+  NCCL_IGNORE_CPU_AFFINITY: 1
+  NCCL_NVLS_ENABLE: 0
+  NCCL_DEBUG: WARN
+  TORCH_NCCL_ASYNC_ERROR_HANDLING: 1
+command: |
+  vllm serve {model} \
+      --served-model-name {served_model_name} \
+      --host {host} \
+      --port {port} \
+      --trust-remote-code \
+      --tensor-parallel-size {tensor_parallel} \
+      --pipeline-parallel-size {pipeline_parallel} \
+      --moe-backend marlin \
+      --enforce-eager \
+      --dtype auto \
+      --max-model-len {max_model_len} \
+      --max-num-seqs {max_num_seqs} \
+      --kv-cache-dtype {kv_cache_dtype} \
+      --kv-cache-memory {kv_cache_memory} \
+      --block-size {block_size} \
+      --gpu-memory-utilization {gpu_memory_utilization} \
+      --speculative-config '{speculative_config}' \
+      --limit-mm-per-prompt '{limit_mm_per_prompt}' \
+      --chat-template {chat_template} \
+      --skip-mm-profiling \
+      --enable-auto-tool-choice \
+      --tool-call-parser glm47 \
+      --reasoning-parser glm45
