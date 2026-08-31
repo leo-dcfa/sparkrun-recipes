@@ -1,0 +1,36 @@
+# tonyd2wild's DeepSeek-V4-Flash-Vision-Exp port baked onto the p4a image, for
+# the Vision-Exp lane (native image input inside vLLM, DSpark intact).
+#
+# Source: branch vision-exp-default, vision-exp/port/ of
+# https://github.com/tonyd2wild/DeepSeek-v4-Flash-Vision-Exp-DSpark-1M-NVFP4-KV-2x-DGX-Spark
+# (adopted 2026-09-01; files vendored in recipes/mods/vision-exp/). Upstream
+# bind-mounts four files onto their probe-c-p2b image; sparkrun recipes cannot
+# express extra volumes (same constraint as the GLM DFlash2 lane), so they are
+# baked in here instead, on top of stage-c-p4a (Patch 3/4/A already baked —
+# upstream's patch3-scheduler/spec-dspark mounts are not needed).
+#
+# Upstream's ds4v_model.py / ds4v_registry.py are NOT static files: they are
+# the serving image's OWN model.py/registry.py run through idempotent patchers
+# (11 anchored edits + a multimodal registry alias). Running the patchers at
+# build time keeps them consistent with THIS image's vLLM. Both verified to
+# apply cleanly to stage-c-p4a on 2026-09-01. If a patcher anchor ever fails,
+# the build fails here — never at first boot.
+#
+# After building against a DIFFERENT base, clear vLLM's model-inspection cache
+# on BOTH nodes (~/.cache/huggingface/jitcache/vllm/modelinfos) — it is keyed
+# by module+class and silently serves stale "text-only" answers (upstream
+# blocker #7).
+#
+# Build on BOTH nodes (context = ~/sparkrun-recipes):
+#   docker build -f docker/Dockerfile.dspark-vision-exp \
+#     -t vllm-dspark-runtime:dspark-nvfp4-vision-exp ~/sparkrun-recipes
+FROM vllm-dspark-runtime:dspark-nvfp4-stage-c-p4a
+COPY recipes/mods/vision-exp/ds4v_vision.py /opt/env/lib/python3.12/site-packages/vllm/models/deepseek_v4/nvidia/ds4v_vision.py
+COPY recipes/mods/vision-exp/ds4v_mm.py /opt/env/lib/python3.12/site-packages/vllm/models/deepseek_v4/nvidia/ds4v_mm.py
+COPY recipes/mods/vision-exp/patch_vision.py recipes/mods/vision-exp/patch_registry.py /tmp/ds4v/
+# patch-check: fail the build, not the first boot, if an anchor or the syntax breaks
+RUN /opt/env/bin/python /tmp/ds4v/patch_vision.py /opt/env/lib/python3.12/site-packages/vllm/models/deepseek_v4/nvidia/model.py \
+ && /opt/env/bin/python /tmp/ds4v/patch_registry.py /opt/env/lib/python3.12/site-packages/vllm/model_executor/models/registry.py \
+ && /opt/env/bin/python -c "import ast; [ast.parse(open(p).read()) for p in ('/opt/env/lib/python3.12/site-packages/vllm/models/deepseek_v4/nvidia/model.py','/opt/env/lib/python3.12/site-packages/vllm/model_executor/models/registry.py','/opt/env/lib/python3.12/site-packages/vllm/models/deepseek_v4/nvidia/ds4v_vision.py','/opt/env/lib/python3.12/site-packages/vllm/models/deepseek_v4/nvidia/ds4v_mm.py')]" \
+ && grep -q DeepseekV4VForConditionalGeneration /opt/env/lib/python3.12/site-packages/vllm/model_executor/models/registry.py \
+ && rm -rf /tmp/ds4v

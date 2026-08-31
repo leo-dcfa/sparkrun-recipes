@@ -2,7 +2,7 @@
 # day-to-day on the 2x DGX Spark (GB10) homelab.
 #
 # make hy3                              # launch Hy3-295B NVFP4-W4A16 + MTP (local)
-# make deepseek                         # launch DeepSeek-V4-Flash-0731 + DSpark drafter, NVFP4 KV, 1M ctx (local)
+# make deepseek                         # launch DeepSeek-V4-Flash-Vision-Exp (native vision) + DSpark, NVFP4 KV, 1M ctx (local)
 # make mimo                             # launch MiMo-V2.5 NVFP4 Omni (multimodal), 1M ctx (local, 2-node)
 # make inkling                          # launch TML Inkling-Small NVFP4 (multimodal MoE), SGLang+DSpark, 1M ctx (local, 2-node)
 # make step                             # launch Step-3.7-Flash NVFP4, 256K ctx (local, 2-node)
@@ -33,15 +33,18 @@ export PATH := $(HOME)/.local/bin:$(PATH)
 
 # Local recipes (this repo) — run by file path, no registry needed.
 HY3_RECIPE            := recipes/hy3-295b-nvfp4.yaml
-# DeepSeek-V4-Flash-0731 (official release) + DSpark drafter — tonyd2wild's
-# forum lane (adopted 2026-08-01; E15 STACK campaign winner adopted 2026-08-29:
-# k=5 + Patch A + fused Markov argmax @ gmu 0.78). Measured here 2026-08-29:
-# 64.4 tok/s battery mean / 91 peak (was 53.2/64.9 on k=3), c4 aggregate 172
-# (was 124), 1M ctx, NVFP4 KV. Runs the Patch-4+A committed image
-# vllm-dspark-runtime:dspark-nvfp4-stage-c-p4a, built on BOTH nodes with
-# docker/Dockerfile.dspark-0731-p4a (worker builds from ~/staging-p4a) — see
-# the yaml header.
-DEEPSEEK_RECIPE       := recipes/deepseek-v4-flash-0731.yaml
+# DeepSeek-V4-Flash-Vision-Exp (native image input) + DSpark — tonyd2wild's
+# vision port, adopted 2026-09-01 from the vision-exp-default branch of the
+# (renamed) upstream repo. Same LM as 0731 with a 3-layer drafter (k=3, not 5)
+# and the ViT+aligner running inside vLLM; image vllm-dspark-runtime:
+# dspark-nvfp4-vision-exp is built on BOTH nodes with
+# docker/Dockerfile.dspark-vision-exp. See the yaml header for the full
+# adoption notes and deviations.
+# (The 0731 TEXT lane was superseded the same day; its yaml + p4a image are
+#  kept for rollback — point DEEPSEEK_RECIPE back at
+#  recipes/deepseek-v4-flash-0731.yaml. It is the faster lane for text-only
+#  work: ~64 tok/s battery mean vs the vision lane's upstream ~55/33.)
+DEEPSEEK_RECIPE       := recipes/deepseek-v4-flash-vision-exp.yaml
 # GLM-5.3-Flash NVFP4 + DFlash2 speculative decoding (320B total / 18B active,
 # natively multimodal MoE). tonyd2wild's lane, adopted 2026-08-30 — see the yaml
 # header for the full why. Measured here that day, single-stream, warm, greedy,
@@ -103,7 +106,7 @@ help: ## Show this help
 hy3: ## Launch Hy3-295B NVFP4-W4A16 + MTP (local, 2-node)
 	$(RUN) $(HY3_RECIPE) $(OVERRIDES)
 
-deepseek: ## Launch DeepSeek-V4-Flash-0731 + DSpark drafter (tonyd2wild lane, 2-node, NVFP4 KV, 1M ctx)
+deepseek: ## Launch DeepSeek-V4-Flash-Vision-Exp + DSpark (tonyd2wild vision port, 2-node, NVFP4 KV, 1M ctx)
 	$(RUN) $(DEEPSEEK_RECIPE) $(OVERRIDES)
 
 glm: ## Launch GLM-5.3-Flash NVFP4 + DFlash2 k=7 spec decode (local, 2-node, 256K ctx)
@@ -126,7 +129,7 @@ step: ## Launch Step-3.7-Flash NVFP4 (local, 2-node, 256K ctx, MiaAI no-MTP lane
 hy3-dry: ## Estimate VRAM/context fit for Hy3-295B NVFP4-W4A16
 	$(RUN) $(HY3_RECIPE) $(OVERRIDES) --dry-run
 
-deepseek-dry: ## Estimate VRAM/context fit for DeepSeek-V4-Flash-0731 + DSpark
+deepseek-dry: ## Estimate VRAM/context fit for DeepSeek-V4-Flash-Vision-Exp + DSpark
 	$(RUN) $(DEEPSEEK_RECIPE) $(OVERRIDES) --dry-run
 
 glm-dry: ## Estimate VRAM/context fit for GLM-5.3-Flash NVFP4 + DFlash2
@@ -151,7 +154,7 @@ stop: ## Stop all workloads on the cluster (sparkrun + inkling eugr lanes)
 stop-hy3: ## Stop just the Hy3-295B NVFP4 workload
 	$(SPARKRUN) stop $(HY3_RECIPE) --cluster $(CLUSTER)
 
-stop-deepseek: ## Stop just the DeepSeek-V4-Flash-0731 + DSpark workload
+stop-deepseek: ## Stop just the DeepSeek-V4-Flash-Vision-Exp + DSpark workload
 	$(SPARKRUN) stop $(DEEPSEEK_RECIPE) --cluster $(CLUSTER)
 
 stop-glm: ## Stop just the GLM-5.3-Flash NVFP4 + DFlash2 workload

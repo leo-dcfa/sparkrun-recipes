@@ -42,21 +42,15 @@
 # (broken or neutral on this image), draft_sample_method (no-op — drafter
 # always argmaxes; kept in the config as harmless).
 #
-# 2026-09-01 — Vision-Exp evaluated, NOT adoptable yet. Upstream renamed the
-# repo (DeepSeek-v4-Flash-0731-... -> DeepSeek-v4-Flash-Vision-Exp-...) and
-# made DeepSeek-V4-Flash-Vision-Exp (native image input, HF pin 86f746b) the
-# default lane. Everything else in that repo is already adopted here (E15
-# STACK, 2026-08-29); the vision port itself hinges on four vLLM integration
-# files (ds4v_model.py / ds4v_vision.py / ds4v_mm.py / ds4v_registry.py,
-# bind-mounted per their VISION-EXP-DEFAULT-CONFIG.md) that tonyd2wild has NOT
-# published: not in any branch of the repo, not in the HF checkpoint (pinned or
-# latest), not on the forum threads. vLLM upstream support is an unmerged
-# draft (vllm-project/vllm#54566). Without the files the checkpoint fails at
-# load ("no module or parameter named aligner in DeepseekV4ForCausalLM" — their
-# issue #43). Re-check the repo for the ds4v files before trying again; also
-# note their own caveats: no bidirectional attention in image spans (hurts
-# OCR/charts), bias_vl unapplied, prose draft acceptance ~25% (their prose
-# decode 33 tok/s vs the 64.4 battery mean this text lane measures here).
+# 2026-09-01 — SUPERSEDED as `make deepseek` by
+# recipes/deepseek-v4-flash-vision-exp.yaml: upstream renamed the repo
+# (...0731... -> ...Vision-Exp...) and made the native-vision
+# DeepSeek-V4-Flash-Vision-Exp checkpoint the default lane. The ds4v port
+# files live on the vision-exp-default BRANCH under vision-exp/port/ — main
+# only documents the mounts, which is why an earlier note here briefly and
+# WRONGLY called them unpublished. This yaml is kept for rollback (point
+# DEEPSEEK_RECIPE back at it); it remains the faster TEXT-ONLY lane
+# (~64 tok/s battery mean vs the vision lane's upstream ~55 count/33 prose).
 
 model: deepseek-ai/DeepSeek-V4-Flash-0731
 container: vllm-dspark-runtime:dspark-nvfp4-stage-c-p4a

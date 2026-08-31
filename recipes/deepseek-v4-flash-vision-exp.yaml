@@ -1,0 +1,187 @@
+# Recipe: DeepSeek-V4-Flash-Vision-Exp (native image input) + DSpark drafter,
+#         NVFP4 KV, 1M ctx, for DGX Spark GB10, 2 nodes
+# Source: tonyd2wild's vision port, adopted 2026-09-01 from branch
+#         vision-exp-default (vision-exp/README.md + ds4-vision-tp2.sh) of
+#         https://github.com/tonyd2wild/DeepSeek-v4-Flash-Vision-Exp-DSpark-1M-NVFP4-KV-2x-DGX-Spark
+#         — the RENAMED 0731 repo this lane has tracked all along. Supersedes
+#         recipes/deepseek-v4-flash-0731.yaml as `make deepseek` (that yaml is
+#         kept for rollback: point DEEPSEEK_RECIPE back at it).
+#
+# WHAT THIS IS: DeepSeek's experimental vision build of V4-Flash — the model's
+# own 32-block ViT + aligner running INSIDE vLLM (not a sidecar/proxy), with
+# DSpark speculative decoding intact. The LM is identical to 0731 except:
+# 3-layer drafter (was 1), rms_norm_eps 1e-20, and a modality-specific MoE
+# routing bias (ffn.gate.bias / bias_vl) on all 43 layers.
+#
+# Container is vllm-dspark-runtime:dspark-nvfp4-vision-exp — stage-c-p4a plus
+# the four vision-port files BAKED IN (sparkrun recipes cannot express extra
+# bind-mounts, same constraint as the GLM DFlash2 lane). ds4v_model.py and
+# ds4v_registry.py are the image's OWN files run through upstream's idempotent
+# patchers at build time; ds4v_vision.py/ds4v_mm.py are copied verbatim. Build
+# on BOTH nodes with docker/Dockerfile.dspark-vision-exp (see its header).
+# Patch 3/4/A are already baked in the p4a base — upstream's patch3/spec-dspark
+# bind-mounts are unnecessary here.
+#
+# --hf-overrides architectures=DeepseekV4VForConditionalGeneration is the
+# multimodal switch: vLLM answers is_multimodal_model from a static arch-name
+# table, and the checkpoint reports the text-only class name. The patched
+# registry adds the alias; the override selects it. Without both, load dies
+# with "no module or parameter named 'aligner'" / "is not a multimodal model".
+#
+# GOTCHA (upstream blocker #7, hit here 2026-09-01): the stage-c image family
+# BAKES VLLM_CACHE_ROOT=/cache/huggingface/vllm-cache (host:
+# ~/.cache/huggingface/vllm-cache), and vLLM caches model inspection there
+# under modelinfos/, keyed module+class with a validity hash over ONLY the
+# package __init__.py — which the vision patch does not touch. A stale
+# supports_multimodal:false entry from the 0731 runs therefore validated and
+# the first vision boot refused images ("is not a multimodal model") while
+# loading the checkpoint fine. Because p4a (text) and this image share that
+# key, clearing is not enough — either lane would re-poison the other. Fix:
+# this recipe overrides VLLM_CACHE_ROOT to a lane-private dir (env below), so
+# each image keeps its own modelinfos. Cost: one cold autotune/compile pass on
+# the first boot after the switch.
+#
+# Config vs the 0731 lane (upstream-measured on this checkpoint, 2026-08-31):
+#   * k: 5 -> 3. The drafter is now 3 predict layers; carrying k=5 wastes the
+#     draft tail: accept 0.542/52.1 tok/s (k=5) vs 0.830/54.6 (k=3).
+#   * gmu 0.78 -> 0.85, max_num_seqs 6 -> 12: upstream's validated vision
+#     agent profile (KV pool ~2.9M tokens measured). Their note: issue #8
+#     killed 0.80 under traffic, but 0.85 is the value the vision numbers were
+#     measured at; 0.78 was the conservative single-lane text value.
+#   * VLLM_DSPARK_FUSED_MARKOV_ARGMAX 1 -> 0 and DRAFT_CAPTURE_SIZES dropped:
+#     the E15 STACK wins were measured on the 1-layer 0731 drafter; upstream's
+#     vision profile runs both off. Patch A stays baked but inert. Re-run the
+#     E15 sweep on this drafter before re-enabling.
+#   * ctx stays 1048576, NOT upstream's 1.5M: local stance unchanged — >1M
+#     needs VLLM_ALLOW_LONG_MAX_MODEL_LEN and extrapolates past YaRN
+#     calibration. Expect a smaller KV pool than their 2.9M figure.
+#   * --tokenizer-mode deepseek_v4 + --enable-flashinfer-autotune added (in
+#     upstream's verified vision command; harmless on this image family).
+#   * NO --max-cudagraph-capture-size (E15/PR#5: stale literal silently
+#     truncates capture; vLLM derives max_num_seqs x (k+1) itself). Upstream's
+#     launcher passes 12 — deliberate local divergence.
+#   * DSPARK_SLOT_CLAMP / VLLM_TRITON_MLA_SPARSE / HARDWARE_SCHEDULER_EARLY_STOP
+#     from upstream's launcher stay OUT: documented locally (0731 .env header)
+#     as probe-c/aidendle94-lane switches, not part of the validated stage-c
+#     stack. Revisit only if the boot log or traffic says otherwise.
+#
+# Model resolves to HF latest (sparkrun has no revision field — same gap noted
+# in mimo-v2.5-omni.yaml). Upstream pins 86f746b; commits since (e46e16b) are
+# README/eval-results only, weights identical (verified 2026-09-01).
+#
+# KNOWN DEVIATIONS from DeepSeek's reference (upstream's, inherited here —
+# quality, not crashes; text-only requests are bit-identical to 0731 behavior):
+#   1. No bidirectional attention within image spans (causal sparse only) —
+#      expect degradation on dense-intra-image work: OCR, charts, documents.
+#   2. bias_vl is loaded but NOT applied — image tokens route through the text
+#      gate bias.
+# Prose draft acceptance is ~25% on this variant; upstream measured prose
+# decode 33 tok/s vs code 52 vs count 80 (warmed). Slower than the 0731 text
+# lane (their 54.6 vs ~70-80 on count) — known, attributed to per-step cost
+# (raw-input-ids pass + resident ViT), not speculation.
+#
+# Parsers: deepseek_v4 tool/reasoning parsers are registered in the image
+# (inherited from stage-c, verified 2026-08-01); forum default runs
+# thinking:false — flip chat_template_kwargs to '{"thinking":true}' for
+# reasoning traces.
+
+model: deepseek-ai/DeepSeek-V4-Flash-Vision-Exp
+container: vllm-dspark-runtime:dspark-nvfp4-vision-exp
+defaults:
+  host: 0.0.0.0
+  port: 8000
+  served_model_name: deepseek-v4-flash-vision-exp
+  tensor_parallel: 2
+  gpu_memory_utilization: 0.85
+  max_model_len: 1048576
+  max_num_seqs: 12
+  max_num_batched_tokens: 8192
+  kv_cache_dtype: nvfp4_ds_mla
+  block_size: 256
+  tokenizer_mode: deepseek_v4
+  tool_call_parser: deepseek_v4
+  reasoning_parser: deepseek_v4
+  # Explicit start/end strings: same fix as the 0731 lane (2026-08-01) — without
+  # this, stray </think> tags leak into content via the LiteLLM /v1/messages path.
+  reasoning_config: '{"reasoning_parser":"deepseek_v4","reasoning_start_str":"<think>","reasoning_end_str":"</think>"}'
+  # k=3 matches num_nextn_predict_layers=3 — see header. draft_sample_method is
+  # a no-op (drafter always argmaxes) but kept as upstream ships it.
+  speculative_config: '{"method":"dspark","num_speculative_tokens":3,"draft_sample_method":"probabilistic"}'
+  chat_template_kwargs: '{"thinking":false}'
+  hf_overrides: '{"architectures":["DeepseekV4VForConditionalGeneration"]}'
+env:
+  # Engine-ready timeout raised from the vLLM default 600s: cold-cache 2-node
+  # loads outlive the default and cascade into shm/NCCL "cancelled" crashes at
+  # load completion (hy3 took 868s on 2026-08-15).
+  VLLM_ENGINE_READY_TIMEOUT_S: "5400"
+  # Mirrors recipes/deepseek-v4-flash-vision-exp.env — keep the two in sync.
+  # This is the 0731 switch set minus the two E15 drafter switches (see header);
+  # do NOT set VLLM_WORKER_MULTIPROC_METHOD (spawn default is what the stage-c
+  # lane validates).
+  HF_HUB_DISABLE_XET: '1'
+  # Lane-private vLLM cache root — see the GOTCHA above. Overrides the
+  # VLLM_CACHE_ROOT the image bakes (/cache/huggingface/vllm-cache).
+  VLLM_CACHE_ROOT: /cache/huggingface/vllm-cache-vision-exp
+  TRITON_CACHE_DIR: /cache/huggingface/jitcache/triton
+  TORCH_EXTENSIONS_DIR: /cache/huggingface/jitcache/torch_extensions
+  VLLM_CACHE_DIR: /cache/huggingface/jitcache/vllm
+  FLASHINFER_WORKSPACE_BASE: /cache/huggingface/jitcache/flashinfer
+  TVM_FFI_CACHE_DIR: /cache/huggingface/jitcache/tvm-ffi
+  XDG_CACHE_HOME: /cache/huggingface/jitcache
+  VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS: '0'
+  PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+  VLLM_USE_FLASHINFER_SAMPLER: '1'
+  VLLM_USE_B12X_MOE: '1'
+  VLLM_USE_B12X_WO_PROJECTION: '1'
+  B12X_W4A16_TC_DECODE: '0'
+  VLLM_DSPARK_GPU_REJECTED_CONTEXT_MASK: '1'
+  VLLM_DSPARK_CONFIDENCE_SCHEDULER: 'off'
+  VLLM_DSPARK_LOCAL_ARGMAX: '1'
+  VLLM_DSPARK_REPLICATE_MARKOV_W1: '1'
+  # E15 drafter switches OFF for the 3-layer Vision-Exp drafter — see header.
+  VLLM_DSPARK_FUSED_MARKOV_ARGMAX: '0'
+  VLLM_DSPARK_REFERENCE_KV_QUANT_DEQUANT: '0'
+  VLLM_DSV4_B12X_COMPRESSED_MLA: '0'
+  VLLM_DSV4_DSPARK_DEFER_TARGET_CAPTURE: '0'
+  CUTE_DSL_ARCH: sm_121a
+  TORCH_CUDA_ARCH_LIST: '12.1a'
+  FLASHINFER_CUDA_ARCH_LIST: '12.1a'
+  FLASHINFER_DISABLE_VERSION_CHECK: '1'
+  TILELANG_CLEANUP_TEMP_FILES: '1'
+  DG_JIT_USE_NVRTC: '0'
+  # NB: Stage-C keeps nvcc in the venv, NOT /usr/local/cuda — pointing DeepGEMM
+  # at the usual path aborts weight post-processing (hit 2026-08-01).
+  DG_JIT_NVCC_COMPILER: /opt/env/bin/nvcc
+  NCCL_NET: IB
+  NCCL_IB_DISABLE: '0'
+  NCCL_IB_GID_INDEX: '3'
+  NCCL_IB_ADDR_FAMILY: AF_INET
+  NCCL_IB_ROCE_VERSION_NUM: '2'
+  NCCL_CROSS_NIC: '1'
+  NCCL_CUMEM_ENABLE: '0'
+  NCCL_IGNORE_CPU_AFFINITY: '1'
+  NCCL_NVLS_ENABLE: '0'
+  NCCL_DEBUG: WARN
+# Full binary path below: the image keeps vllm in /opt/env/bin, which is NOT on
+# the container PATH — bare `vllm` exits immediately (hit 2026-08-01).
+command: |
+  /opt/env/bin/vllm serve {model} --host {host} --port {port} --trust-remote-code \
+    --hf-overrides '{hf_overrides}' \
+    --served-model-name {served_model_name} \
+    -tp {tensor_parallel} --kv-cache-dtype {kv_cache_dtype} --block-size {block_size} \
+    --gpu-memory-utilization {gpu_memory_utilization} --max-model-len {max_model_len} \
+    --max-num-seqs {max_num_seqs} --max-num-batched-tokens {max_num_batched_tokens} \
+    --async-scheduling --enable-chunked-prefill --enable-prefix-caching \
+    --generation-config vllm \
+    --tokenizer-mode {tokenizer_mode} \
+    --tool-call-parser {tool_call_parser} --reasoning-parser {reasoning_parser} \
+    --reasoning-config '{reasoning_config}' \
+    --enable-auto-tool-choice \
+    --default-chat-template-kwargs '{chat_template_kwargs}' \
+    --enable-flashinfer-autotune \
+    --speculative-config '{speculative_config}'
+runtime: vllm
+min_nodes: 2
+metadata:
+  description: DeepSeek-V4-Flash-Vision-Exp (native vision) + DSpark drafter, NVFP4 KV, 1M ctx (tonyd2wild port)
+recipe_version: '2'
