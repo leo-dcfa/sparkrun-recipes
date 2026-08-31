@@ -41,6 +41,22 @@
 # the bottleneck), NCCL_PROTO=LL128, B12X mHC/sparse-indexer/compressed-MLA
 # (broken or neutral on this image), draft_sample_method (no-op — drafter
 # always argmaxes; kept in the config as harmless).
+#
+# 2026-09-01 — Vision-Exp evaluated, NOT adoptable yet. Upstream renamed the
+# repo (DeepSeek-v4-Flash-0731-... -> DeepSeek-v4-Flash-Vision-Exp-...) and
+# made DeepSeek-V4-Flash-Vision-Exp (native image input, HF pin 86f746b) the
+# default lane. Everything else in that repo is already adopted here (E15
+# STACK, 2026-08-29); the vision port itself hinges on four vLLM integration
+# files (ds4v_model.py / ds4v_vision.py / ds4v_mm.py / ds4v_registry.py,
+# bind-mounted per their VISION-EXP-DEFAULT-CONFIG.md) that tonyd2wild has NOT
+# published: not in any branch of the repo, not in the HF checkpoint (pinned or
+# latest), not on the forum threads. vLLM upstream support is an unmerged
+# draft (vllm-project/vllm#54566). Without the files the checkpoint fails at
+# load ("no module or parameter named aligner in DeepseekV4ForCausalLM" — their
+# issue #43). Re-check the repo for the ds4v files before trying again; also
+# note their own caveats: no bidirectional attention in image spans (hurts
+# OCR/charts), bias_vl unapplied, prose draft acceptance ~25% (their prose
+# decode 33 tok/s vs the 64.4 battery mean this text lane measures here).
 
 model: deepseek-ai/DeepSeek-V4-Flash-0731
 container: vllm-dspark-runtime:dspark-nvfp4-stage-c-p4a
