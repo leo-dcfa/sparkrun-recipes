@@ -3,7 +3,15 @@
 # Source: tonyd2wild's vision port, adopted 2026-09-01 from branch
 #         vision-exp-default (vision-exp/README.md + ds4-vision-tp2.sh) of
 #         https://github.com/tonyd2wild/DeepSeek-v4-Flash-Vision-Exp-DSpark-1M-NVFP4-KV-2x-DGX-Spark
-#         — the RENAMED 0731 repo this lane has tracked all along. Supersedes
+#         — the RENAMED 0731 repo this lane has tracked all along.
+#         Re-synced 2026-09-03 to upstream main @ 9bf6e53 (vision-exp-default is
+#         merged; Vision-Exp is now their default recipe; the launcher is moving
+#         to launchers/ds4-vision-tp2.sh on their cleanup branch). Changes taken:
+#         k 3 -> 5 (retraction, below), VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS, and
+#         Patch 5 baked into the image (container tag -p5). The four vendored
+#         port files did not change upstream (verified: no diff under
+#         vision-exp/port/), so the vision layer itself is untouched. Clone
+#         tracked at ~/src/ds4-vision-exp. Supersedes
 #         recipes/deepseek-v4-flash-0731.yaml as `make deepseek` (that yaml is
 #         kept for rollback: point DEEPSEEK_RECIPE back at it).
 #
@@ -13,7 +21,10 @@
 # 3-layer drafter (was 1), rms_norm_eps 1e-20, and a modality-specific MoE
 # routing bias (ffn.gate.bias / bias_vl) on all 43 layers.
 #
-# Container is vllm-dspark-runtime:dspark-nvfp4-vision-exp — stage-c-p4a plus
+# Container is vllm-dspark-runtime:dspark-nvfp4-vision-exp-p5 — the vision-exp
+# image (below) plus Patch 5, tonyd2wild's stop-strings-inside-reasoning fix
+# (docker/Dockerfile.dspark-vision-exp-p5; opt-out
+# VLLM_SUPPRESS_STOPS_IN_REASONING=0). vision-exp itself is stage-c-p4a plus
 # the four vision-port files BAKED IN (sparkrun recipes cannot express extra
 # bind-mounts, same constraint as the GLM DFlash2 lane). ds4v_model.py and
 # ds4v_registry.py are the image's OWN files run through upstream's idempotent
@@ -42,8 +53,14 @@
 # the first boot after the switch.
 #
 # Config vs the 0731 lane (upstream-measured on this checkpoint, 2026-08-31):
-#   * k: 5 -> 3. The drafter is now 3 predict layers; carrying k=5 wastes the
-#     draft tail: accept 0.542/52.1 tok/s (k=5) vs 0.830/54.6 (k=3).
+#   * k stays 5 (this lane ran k=3 from 2026-09-01 to 2026-09-03). Upstream's
+#     "k=3 wins on this checkpoint" A/B (accept 0.830/54.6 vs 0.542/52.1 at
+#     k=5) was measured WITHOUT the Patch 4 spec-dspark.py mount, which loads
+#     the draft's shared expert uninitialised and collapses acceptance — it is
+#     RETRACTED (their issue #48); with Patch 4, k=5 wins and is their default
+#     everywhere. Patch 4 is baked into the p4a base this image builds on, so
+#     k=5 is the right setting here. k=6 is rejected at boot (must be divisible
+#     by n_predict=5).
 #   * gmu 0.78 -> 0.85, max_num_seqs 6 -> 12: upstream's validated vision
 #     agent profile (KV pool ~2.9M tokens measured). Their note: issue #8
 #     killed 0.80 under traffic, but 0.85 is the value the vision numbers were
@@ -80,13 +97,26 @@
 # lane (their 54.6 vs ~70-80 on count) — known, attributed to per-step cost
 # (raw-input-ids pass + resident ViT), not speculation.
 #
+# NOT taken from the 2026-09-03 resync, and why:
+#   * fix(nvfp4) #37 (widen the decode dispatch in flashmla_sparse.py to
+#     nvfp4_ds_mla) targets their official-main port. The stage-c family here
+#     has no nvfp4 code in that file at all — nvfp4_ds_mla is served by the
+#     stage-A/B/C kernels — so there is nothing to widen (checked in-image).
+#   * "do not pin NCCL_IB_GID_INDEX" (#38) is a dual-HCA / merged-NIC finding
+#     (GID table drift). This pair pins ONE HCA per node via sparkrun and the
+#     GID 3 pin has been stable for weeks; left as is. Revisit if the fabric
+#     ever goes dual-port.
+#   * DSPARK_SLOT_CLAMP / VLLM_TRITON_MLA_SPARSE / HARDWARE_SCHEDULER_EARLY_STOP
+#     / VLLM_SKIP_INIT_MEMORY_CHECK from their self-contained sparkrun recipe:
+#     same stance as before (probe-c switches, not the validated stage-c set).
+#
 # Parsers: deepseek_v4 tool/reasoning parsers are registered in the image
 # (inherited from stage-c, verified 2026-08-01); forum default runs
 # thinking:false — flip chat_template_kwargs to '{"thinking":true}' for
 # reasoning traces.
 
 model: deepseek-ai/DeepSeek-V4-Flash-Vision-Exp
-container: vllm-dspark-runtime:dspark-nvfp4-vision-exp
+container: vllm-dspark-runtime:dspark-nvfp4-vision-exp-p5
 defaults:
   host: 0.0.0.0
   port: 8000
@@ -104,9 +134,11 @@ defaults:
   # Explicit start/end strings: same fix as the 0731 lane (2026-08-01) — without
   # this, stray </think> tags leak into content via the LiteLLM /v1/messages path.
   reasoning_config: '{"reasoning_parser":"deepseek_v4","reasoning_start_str":"<think>","reasoning_end_str":"</think>"}'
-  # k=3 matches num_nextn_predict_layers=3 — see header. draft_sample_method is
-  # a no-op (drafter always argmaxes) but kept as upstream ships it.
-  speculative_config: '{"method":"dspark","num_speculative_tokens":3,"draft_sample_method":"probabilistic"}'
+  # k=5 — upstream's validated default WITH Patch 4 (baked here). Do not swap
+  # back to k=3: that A/B was an unpatched measurement, retracted (see header).
+  # draft_sample_method is a no-op (drafter always argmaxes) but kept as
+  # upstream ships it.
+  speculative_config: '{"method":"dspark","num_speculative_tokens":5,"draft_sample_method":"probabilistic"}'
   chat_template_kwargs: '{"thinking":false}'
   hf_overrides: '{"architectures":["DeepseekV4VForConditionalGeneration"]}'
 env:
@@ -114,6 +146,12 @@ env:
   # loads outlive the default and cascade into shm/NCCL "cancelled" crashes at
   # load completion (hy3 took 868s on 2026-08-15).
   VLLM_ENGINE_READY_TIMEOUT_S: "5400"
+  # Inference-time RPC deadline (upstream #8/#51, 2026-09-02). ENGINE_READY above
+  # covers boot only; vLLM's default here is 300 s, shorter than a cold
+  # CuTeDSL/TileLang JIT triggered mid-inference by an MoE/batch shape the warmup
+  # never covered — the worker blocks, the deadline declares it dead, the engine
+  # shuts down. 1800 s = upstream's value.
+  VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: "1800"
   # Mirrors recipes/deepseek-v4-flash-vision-exp.env — keep the two in sync.
   # This is the 0731 switch set minus the two E15 drafter switches (see header);
   # do NOT set VLLM_WORKER_MULTIPROC_METHOD (spawn default is what the stage-c
@@ -183,5 +221,5 @@ command: |
 runtime: vllm
 min_nodes: 2
 metadata:
-  description: DeepSeek-V4-Flash-Vision-Exp (native vision) + DSpark drafter, NVFP4 KV, 1M ctx (tonyd2wild port)
+  description: DeepSeek-V4-Flash-Vision-Exp (native vision) + DSpark k=5, NVFP4 KV, 1M ctx, Patch 5 (tonyd2wild port)
 recipe_version: '2'

@@ -1,0 +1,90 @@
+# Qwen3.8-Flash-Next SGLang image for the qwen38fn lane: tonyd2wild's STAGED
+# successor to their live TRT-LLM-path image, built locally.
+#
+# Source: Dockerfile.qwen38fn-sm121-triton-varlen @ b515104 of
+#   https://github.com/tonyd2wild/Qwen3.8-Flash-Next-NVFP4-DGX-Spark
+# (adopted 2026-09-03; the PR diff is vendored at recipes/mods/qwen38fn/pr36845.diff).
+#
+# Upstream's verdict (sglang PR #36806, merged 2026-08-28): the FlashInfer
+# TRT-LLM sparse-decode kernel SILENTLY CORRUPTS LONG CONTEXT on SM121/GB10 —
+# token-ID-0 ("!") garbage in 1/4 runs at 120K tokens rising to 4/4 at 210K, HTTP
+# 200 throughout. Their earlier images (sm121-qsa, sm121-qsa-mrope1) force-enable
+# exactly that kernel. The fix (sglang PR #36845, validated on DGX Spark at 262K
+# with zero corruption): never TRT-LLM on SM121; a purpose-built Triton
+# online-softmax packed-varlen kernel for QSA decode instead.
+#
+# Build starts from the CLEAN public day-0 image (not their sm121-qsa derivative,
+# whose guard change conflicts with the PR's resolver rewrite), applies the PR,
+# then re-applies the mrope partial-rotary OOB fix (separate vision bug, still
+# required — MROPE-ANALYSIS.md upstream).
+#
+# LOCAL ADDITION — NCCL >= 2.30: the day-0 image bundles NCCL 2.29.7.
+# tonyd2wild LD_PRELOADs NCCL 2.30.4 from a host bind-mount (/opt/nccl) and
+# MiaAI stages 2.30.7 the same way ("house GB10+CX7 pin for CUDA graphs + TP").
+# sparkrun recipes cannot express extra volumes, so the 2.30.7 wheel is
+# installed into the image and LD_PRELOADed from the same /opt/nccl path
+# upstream uses. NB (verified 2026-09-03): torch here links NCCL STATICALLY
+# (no libnccl in torch/lib), so torch.cuda.nccl.version() reports 2.29.7 no
+# matter what — that is not the receipt. SGLang's communicator dlopens
+# libnccl.so.2 itself, which is what the wheel upgrade + preload replace; the
+# runtime receipt is the boot line "sglang is using nccl==2.30.7" (upstream's
+# DEPLOY-REPORT shows the same line for their 2.30.4 preload). The build
+# asserts the preloaded library itself reports >= 2.30.
+#
+# Upstream's promotion checklist still applies to THIS build (see the recipe
+# header): >120K-token soak, 6-way tool-carrying load test, an image request.
+#
+# Build on BOTH nodes (context = ~/sparkrun-recipes):
+#   docker build -f docker/Dockerfile.qwen38fn-sm121-triton-varlen \
+#     -t qwen38fn-sglang:sm121-triton-varlen-local ~/sparkrun-recipes
+
+FROM lmsysorg/sglang:qwen38flashnext
+
+COPY recipes/mods/qwen38fn/pr36845.diff /tmp/pr36845.diff
+
+# PR #36845: SM121 Triton packed-varlen QSA decode (never TRT-LLM on SM121).
+# --exclude test/*: the runtime image ships no test/ tree, and the PR also edits
+# test/registered/kernels/test_qsa.py, so a plain apply fails on that hunk
+# alone (verified 2026-09-03: every source hunk applies; only the test file is
+# missing). Upstream's Dockerfile applies without the exclude because they
+# build from a checkout that has it.
+RUN cd /sgl-workspace/sglang && \
+    (git apply --check --exclude='test/*' -p1 /tmp/pr36845.diff || { echo "PR 36845 no longer applies cleanly - source drifted, rebase the diff"; exit 1; }) && \
+    git apply --exclude='test/*' -p1 --verbose /tmp/pr36845.diff && \
+    rm -f /tmp/pr36845.diff
+
+# mrope partial-rotary OOB fix (same patch as upstream's sm121-qsa-mrope1):
+# qwen4_exp is the first M-RoPE model with partial rotary; the fused mrope Triton
+# kernel's temporal mask is unbounded above the rotary cache row width, causing
+# OOB reads on every image call. Bounding it is a no-op for full-rotary models.
+RUN python3 - <<'PY'
+import glob
+from pathlib import Path
+
+cands = [p for p in glob.glob("/sgl-workspace/sglang/**/rotary_triton.py", recursive=True)]
+if len(cands) != 1:
+    raise SystemExit(f"expected exactly one rotary_triton.py, found: {cands}")
+path = Path(cands[0])
+src = path.read_text()
+
+old = "t_mask = ~(h_mask | w_mask)"
+new = "t_mask = ~(h_mask | w_mask) & (cos_offsets < half_rd)"
+if new in src:
+    raise SystemExit("already patched; refusing to double-patch")
+if src.count(old) < 1:
+    raise SystemExit("unbounded t_mask pattern not found; source drifted, refusing to patch")
+for var in ("cos_offsets", "half_rd"):
+    if var not in src:
+        raise SystemExit(f"expected variable {var} missing from kernel; refusing to patch")
+
+path.write_text(src.replace(old, new))
+print(f"PATCHED {path}: bounded t_mask")
+PY
+
+# NCCL >= 2.30 (local addition, see header). --no-deps so torch is untouched.
+RUN pip install --no-cache-dir --no-deps "nvidia-nccl-cu13>=2.30,<2.31" && \
+    mkdir -p /opt/nccl && \
+    ln -sf "$(python3 -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')/nvidia/nccl/lib/libnccl.so.2" /opt/nccl/libnccl.so.2 && \
+    test -f /opt/nccl/libnccl.so.2 && \
+    python3 -c "import ctypes; l = ctypes.CDLL('/opt/nccl/libnccl.so.2'); v = ctypes.c_int(); l.ncclGetVersion(ctypes.byref(v)); print('preloaded libnccl reports', v.value); assert v.value >= 23000, v.value"
+ENV LD_PRELOAD=/opt/nccl/libnccl.so.2

@@ -7,6 +7,7 @@
 # make inkling                          # launch TML Inkling-Small NVFP4 (multimodal MoE), SGLang+DSpark, 1M ctx (local, 2-node)
 # make step                             # launch Step-3.7-Flash NVFP4, 256K ctx (local, 2-node)
 # make glm                              # launch GLM-5.3-Flash NVFP4 + DFlash2 k=7 spec decode (320B/18B-A multimodal MoE)
+# make qwen38fn                         # launch Qwen3.8-Flash-Next NVFP4, SGLang TP2 + NEXTN spec decode, 262K ctx (local, 2-node)
 # make deepseek MAX_MODEL_LEN=500000    # override context length
 # make deepseek-dry                     # VRAM/fit estimate, no launch
 # make stop                             # stop everything on the cluster
@@ -29,25 +30,31 @@ export PATH := $(HOME)/.local/bin:$(PATH)
 # (MiniMax-M2.7 retired 2026-08-29 — was @official/minimax-m2.7-nvfp4-vllm; Leo stopped using it.)
 # (MiniMax-M3 REAP25 retired 2026-07-24 — was @experimental/minimax-m3-v0-nvfp4-2x-reap25.)
 # (Spark Qwen lanes retired 2026-07-24 — were @official/qwen3.6-27b-fp8-mtp-vllm
-# and recipes/qwen3.6-35b-a3b-nvfp4-fast.yaml; the yaml stays in recipes/ for reference.)
+# and recipes/qwen3.6-35b-a3b-nvfp4-fast.yaml; the yaml stays in recipes/ for reference.
+#  Qwen3.8-Flash-Next came back 2026-09-03 as `make qwen38fn`, see below.)
 
 # Local recipes (this repo) — run by file path, no registry needed.
 HY3_RECIPE            := recipes/hy3-295b-nvfp4.yaml
 # DeepSeek-V4-Flash-Vision-Exp (native image input) + DSpark — tonyd2wild's
 # vision port, adopted 2026-09-01 from the vision-exp-default branch of the
-# (renamed) upstream repo. Same LM as 0731 with a 3-layer drafter (k=3, not 5)
+# (renamed) upstream repo. Same LM as 0731 with a 3-layer drafter (k=5)
 # and the ViT+aligner running inside vLLM; image vllm-dspark-runtime:
 # dspark-nvfp4-vision-exp is built on BOTH nodes with
-# docker/Dockerfile.dspark-vision-exp. See the yaml header for the full
-# adoption notes and deviations.
+# docker/Dockerfile.dspark-vision-exp, then -p5 on top of it with
+# docker/Dockerfile.dspark-vision-exp-p5. Re-synced 2026-09-03 to upstream main:
+# k=5 (their k=3 A/B was measured without Patch 4 and is retracted), an
+# inference-time RPC deadline, and Patch 5 (stop strings no longer truncate
+# reasoning). See the yaml header for the full adoption notes and deviations.
 # (The 0731 TEXT lane was superseded the same day; its yaml + p4a image are
 #  kept for rollback — point DEEPSEEK_RECIPE back at
 #  recipes/deepseek-v4-flash-0731.yaml. It is the faster lane for text-only
 #  work: ~64 tok/s battery mean vs the vision lane's upstream ~55/33.)
 DEEPSEEK_RECIPE       := recipes/deepseek-v4-flash-vision-exp.yaml
 # GLM-5.3-Flash NVFP4 + DFlash2 speculative decoding (320B total / 18B active,
-# natively multimodal MoE). tonyd2wild's lane, adopted 2026-08-30 — see the yaml
-# header for the full why. Measured here that day, single-stream, warm, greedy,
+# natively multimodal MoE). tonyd2wild's lane, adopted 2026-08-30, re-synced
+# 2026-09-03 (KV pin 3 -> 6 GiB: 0 preemptions under load vs 6, pool 310K ->
+# 679K tokens; --max-num-batched-tokens 8192) — see the yaml header for the
+# full why. Measured here that day, single-stream, warm, greedy,
 # 500-token code prompt: 34.5 tok/s thinking-on (46.8% draft acceptance), 41.3
 # thinking-off (60.0%), against the previous MTP-4 lane's ~21. Speculative
 # decoding verifies every drafted token against the full model, so accepted
@@ -75,6 +82,18 @@ INKLING_DEPLOY_DIR     := $(HOME)/spark-vllm-docker
 # (adopted 2026-08-06, unverified on this host). Needs the local image built on
 # BOTH nodes first: see docker/Dockerfile.stepfun37-procps.
 STEP_RECIPE            := recipes/step-3.7-flash-nvfp4.yaml
+# Qwen3.8-Flash-Next NVFP4 (125B-A3B hybrid MoE + 51B PLE + MTP head,
+# multimodal) — tonyd2wild's SGLang TP2 lane (NEXTN spec decode, decode CUDA
+# graphs, 600K-token KV pin, thinking OFF server-side), adopted 2026-09-03 on
+# their STAGED Triton-varlen image built locally on BOTH nodes
+# (docker/Dockerfile.qwen38fn-sm121-triton-varlen -> qwen38fn-sglang:
+# sm121-triton-varlen-local). UNVERIFIED on this host beyond the image build and
+# a dry run — see the yaml header for upstream's promotion checklist and the
+# history of the two earlier (non-Makefile) Qwen3.8-Flash-Next lanes; the
+# hand-run vLLM launcher at ~/src/qwen38-flashnext-vllm stays the fallback.
+# Upstream drops page cache on both nodes before launch (GB10 UMA):
+#   sync; echo 3 | sudo tee /proc/sys/vm/drop_caches   (head AND worker)
+QWEN38FN_RECIPE        := recipes/qwen3.8-flash-next-sglang.yaml
 
 # Optional overrides — set on the command line, e.g.
 # make deepseek MAX_MODEL_LEN=1000000 GPU_MEM=0.85
@@ -92,9 +111,9 @@ endif
 
 RUN := $(SPARKRUN) run --cluster $(CLUSTER)
 
-.PHONY: help hy3 deepseek glm mimo inkling inkling-eugr step \
-        hy3-dry deepseek-dry glm-dry mimo-dry inkling-dry step-dry \
-        stop stop-hy3 stop-deepseek stop-glm stop-mimo stop-inkling stop-step \
+.PHONY: help hy3 deepseek glm mimo inkling inkling-eugr step qwen38fn \
+        hy3-dry deepseek-dry glm-dry mimo-dry inkling-dry step-dry qwen38fn-dry \
+        stop stop-hy3 stop-deepseek stop-glm stop-mimo stop-inkling stop-step stop-qwen38fn \
         status logs list
 
 help: ## Show this help
@@ -106,7 +125,7 @@ help: ## Show this help
 hy3: ## Launch Hy3-295B NVFP4-W4A16 + MTP (local, 2-node)
 	$(RUN) $(HY3_RECIPE) $(OVERRIDES)
 
-deepseek: ## Launch DeepSeek-V4-Flash-Vision-Exp + DSpark (tonyd2wild vision port, 2-node, NVFP4 KV, 1M ctx)
+deepseek: ## Launch DeepSeek-V4-Flash-Vision-Exp + DSpark k=5 (tonyd2wild vision port, 2-node, NVFP4 KV, 1M ctx)
 	$(RUN) $(DEEPSEEK_RECIPE) $(OVERRIDES)
 
 glm: ## Launch GLM-5.3-Flash NVFP4 + DFlash2 k=7 spec decode (local, 2-node, 256K ctx)
@@ -123,6 +142,9 @@ inkling-eugr: ## Launch Inkling via eugr spark-vllm-docker fallback (2-node, 256
 
 step: ## Launch Step-3.7-Flash NVFP4 (local, 2-node, 256K ctx, MiaAI no-MTP lane)
 	$(RUN) $(STEP_RECIPE) $(OVERRIDES)
+
+qwen38fn: ## Launch Qwen3.8-Flash-Next NVFP4 (local, 2-node, SGLang TP2 + NEXTN, 262K ctx, tonyd2wild lane)
+	$(RUN) $(QWEN38FN_RECIPE) $(OVERRIDES)
 
 ## --- dry-run / VRAM fit estimate (no launch) ------------------------------
 
@@ -143,6 +165,9 @@ inkling-dry: ## Estimate VRAM/context fit for TML Inkling-Small NVFP4 (SGLang+DS
 
 step-dry: ## Estimate VRAM/context fit for Step-3.7-Flash NVFP4
 	$(RUN) $(STEP_RECIPE) $(OVERRIDES) --dry-run
+
+qwen38fn-dry: ## Estimate VRAM/context fit for Qwen3.8-Flash-Next NVFP4
+	$(RUN) $(QWEN38FN_RECIPE) $(OVERRIDES) --dry-run
 
 ## --- lifecycle ------------------------------------------------------------
 
@@ -170,6 +195,9 @@ stop-inkling: ## Stop just the Inkling-Small NVFP4 workload (sparkrun lane + eug
 
 stop-step: ## Stop just the Step-3.7-Flash NVFP4 workload
 	$(SPARKRUN) stop $(STEP_RECIPE) --cluster $(CLUSTER)
+
+stop-qwen38fn: ## Stop just the Qwen3.8-Flash-Next NVFP4 workload
+	$(SPARKRUN) stop $(QWEN38FN_RECIPE) --cluster $(CLUSTER)
 
 status: ## Show running sparkrun containers
 	$(SPARKRUN) status --cluster $(CLUSTER)

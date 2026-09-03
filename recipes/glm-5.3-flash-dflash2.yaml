@@ -2,7 +2,11 @@
 # GLM-5.3-Flash NVFP4 + DFlash2 speculative decoding, 2x DGX Spark GB10, TP=2.
 #
 # Supersedes recipes/glm-5.3-flash-nvfp4.yaml (MiaAI v8 image, MTP-4, ~21 tok/s).
-# Source: tonyd2wild/GLM-5.3-Flash-NVFP4-DFlash2-2x-DGX-Spark, adopted 2026-08-30.
+# Source: tonyd2wild/GLM-5.3-Flash-NVFP4-DFlash2-2x-DGX-Spark, adopted 2026-08-30;
+#   re-synced 2026-09-03 to upstream main @ 050081d (KV pin 3 -> 6 GiB,
+#   --max-num-batched-tokens 8192, RedHatAI made the launcher default, and the
+#   k / CUDA-graph findings in docs/TP2-SPEC-DEPTH-AND-KV-2026-09-02.md — see
+#   the notes below; clone tracked at ~/src/glm53-dflash2).
 #   Measured there on identical hardware and context:
 #   MTP-4 21.8 tok/s -> DFlash2 46.9 tok/s (2.15x), 74.1% draft acceptance,
 #   ~0 KV cost for the drafter (parasitic slot-sharing with the MLA tensors).
@@ -51,6 +55,23 @@
 # (<|begin_of_image|><|image|><|end_of_image|>). The old glm-5.3-flash-nvfp4.yaml
 # lane omitted this, so its advertised vision never actually worked.
 #
+# SPECULATIVE DEPTH (upstream 2026-09-02, 2x GB10, RedHatAI, temp 0): k is a
+# workload choice that inverts at concurrency 4. Single stream k=7 beats k=5 on
+# every prompt (code 47.3 vs 43.2, tooluse 48.7 vs 44.9 tok/s); at C4/C6 k=5
+# wins by 30%/18% because verify compute on the 288-expert MoE grows super-
+# linearly in k. Default stays k=7 (single-user agent is the case here). For
+# real multi-agent load, upstream's schedule is
+#   "num_speculative_tokens_per_batch_size": [[1,3,7],[4,512,5]]
+# — untested on this pair, so not wired. Do NOT tune toward acceptance ratio:
+# it rises under k=5 while throughput falls; mean accepted length is the
+# metric that tracks tok/s.
+#
+# CUDA GRAPHS: FULL_AND_PIECEWISE is a clear win on upstream's TP4 fleet but
+# measured FLAT on TP2 (mean -0.3% across C1-C6, single stream mixed), so this
+# lane keeps --enforce-eager. (If you A/B spec-decode settings, give each arm
+# its own VLLM_CACHE_ROOT: vLLM #53366 omits num_speculative_tokens from the
+# compile-cache hash.)
+#
 # THINKING STAYS ON, deliberately diverging from upstream's launch script, which
 # bakes enable_thinking:false for +8% draft acceptance. With thinking off GLM
 # emits untagged reasoning prose straight into content — nothing for
@@ -67,7 +88,7 @@ container: glm53-flash-dflash2:v11-local
 executor_config:
   entrypoint: ""
 metadata:
-  description: GLM-5.3-Flash NVFP4 + DFlash2 k=7 spec decode on 2x DGX Spark GB10, TP=2, 256K ctx, fp8 KV
+  description: GLM-5.3-Flash NVFP4 + DFlash2 k=7 spec decode on 2x DGX Spark GB10, TP=2, 256K ctx, fp8 KV (6 GiB pin)
   maintainer: local (leo)
   source: https://github.com/tonyd2wild/GLM-5.3-Flash-NVFP4-DFlash2-2x-DGX-Spark
   base_model: zai-org/GLM-5.3-Flash
@@ -85,9 +106,16 @@ defaults:
   max_model_len: 262144
   max_num_seqs: 6
   kv_cache_dtype: fp8_e4m3
-  # 3 GiB pin (310,292-token pool). Upstream shipped this after a 3-way 20K prefill
-  # at 4.4 GiB drove MemAvailable to 3.06 GB and an anti-OOM watchdog killed the engine.
-  kv_cache_memory: 3221225472
+  # 6 GiB pin (upstream 2026-09-02, adopted here 2026-09-03; was 3 GiB =
+  # 310,292-token pool). Upstream measured 6 preemptions under load at 3 GiB and
+  # 0 at 6 GiB, pool 310,292 -> 678,661 tokens, and adopted it unconditionally.
+  # The pin exists at all because an unpinned 4.4 GiB pool once drove
+  # MemAvailable to 3.06 GB during a 3-way 20K prefill and an anti-OOM watchdog
+  # killed the engine — 6 GiB stays well inside that envelope at gmu 0.85.
+  kv_cache_memory: 6442450944
+  # Upstream 2026-09-01 ("concurrency win"); also the value every other vLLM
+  # lane here runs.
+  max_num_batched_tokens: 8192
   # Sized so the KDA linear-attention state page fits the attention page.
   block_size: 2304
   speculative_config: '{"method":"dflash","model":"incoai/GLM-5.3-Flash-DFlash2","num_speculative_tokens":7}'
@@ -130,6 +158,7 @@ command: |
       --dtype auto \
       --max-model-len {max_model_len} \
       --max-num-seqs {max_num_seqs} \
+      --max-num-batched-tokens {max_num_batched_tokens} \
       --kv-cache-dtype {kv_cache_dtype} \
       --kv-cache-memory {kv_cache_memory} \
       --block-size {block_size} \

@@ -1,0 +1,222 @@
+# Recipe: Qwen3.8-Flash-Next NVFP4 on 2x DGX Spark GB10, TP=2, SGLang, NEXTN
+#         (in-checkpoint MTP) speculative decode + decode CUDA graphs, full
+#         multimodal, native 262K ctx.
+# Source: tonyd2wild/Qwen3.8-Flash-Next-NVFP4-DGX-Spark, adopted 2026-09-03 @ b515104
+#         https://github.com/tonyd2wild/Qwen3.8-Flash-Next-NVFP4-DGX-Spark
+#         launch-qwen38fn-sglang-tp2.sh = their verified stable flag set;
+#         Dockerfile.qwen38fn-sm121-triton-varlen = their STAGED successor image
+#         (built locally, see below). Upstream measured on 2x GB10 (TP2, warmed,
+#         temp 0): ~70 tok/s peak on code/structured, ~47 typical mixed, ~20
+#         without MTP; KV pool pinned at 600K tokens; TTFT ~0.2 s.
+#
+# Qwen3.8-Flash-Next: 125B-A3B hybrid (Mamba + Qwen Sparse Attention) MoE with a
+# 51B PLE n-gram embedding table and a built-in 4B MTP head, arch qwen4_exp;
+# natively multimodal (text + image in). ~126 GB at NVFP4 -> ~76 GB/rank at TP2.
+#
+# HISTORY ON THIS PAIR — two earlier lanes, neither ever a Makefile target:
+#   - MiaAI-Lab SGLang lane (~/src/qwen38-flashnext-dspark, image
+#     qwen38-flashnext-dspark:local, YaRN 1M). Abandoned 2026-08-28 for the
+#     token-0 "!!!!" loop under thinking + tools (sglang#36537).
+#   - getrefined vLLM lane (~/src/qwen38-flashnext-vllm/launch-vllm-fn.sh on
+#     vllm/vllm-openai:qwen38-flash-next + a PLE fp8 patch, thinking ON). This is
+#     what LiteLLM's qwen3.8-flash-next entries pointed at until this recipe.
+#     Kept as the hand-run fallback (its qwen3_coder parser is unverified under
+#     thinking + tools; it has no /abort_request, so bound max_tokens).
+# This recipe is the tonyd2wild lane made a sparkrun target. UNVERIFIED on this
+# host as of 2026-09-03: DeepSeek held the cluster, so only the image build (both
+# nodes) and `make qwen38fn-dry` were exercised. Upstream's own promotion
+# checklist before trusting it for 24/7: (1) a >120K-token long-context soak —
+# short smokes CANNOT catch the TRT-LLM corruption the new kernel replaces;
+# (2) their load_test_qwen.py 6-way concurrent tool-carrying load test (mamba
+# pool, boot line must read "Mamba Cache is allocated ... 97"); (3) an image
+# request (mrope path).
+#
+# STATUS 2026-09-03 — BOOTS, THEN CRASHES ON THE FIRST REAL PREFILL. DO NOT USE
+# UNTIL FIXED. Booted cleanly here (all upstream receipts present: "sglang is
+# using nccl==2.30.7", "Mamba Cache is allocated. max_mamba_cache_size: 97",
+# max_total_num_tokens=600000, decode CUDA graphs bs 1-8, thinking off,
+# qwen3_coder parser, 22.97 GB free after load). llama-benchy's warmup and
+# coherence probes (short prompts) passed. The first 2K-token TEXT prompt
+# (pp=2048 cell) killed the scheduler:
+#   TensorCompare.cu:109 _assert_async_cuda_kernel: Assertion `probability
+#   tensor contains either inf, nan or element < 0` failed
+#   -> ProcessGroupNCCL watchdog: CUDA error: device-side assert triggered
+#   surfaced in forward_batch_info._compute_mrope_positions_extend, called from
+#   eagle_worker_v2._draft_extend_for_prefill (EAGLE/NEXTN draft-extend prefill)
+# Full excerpt: ~/bench/qwen38fn-crash-20260903.log. The API server keeps
+# answering /v1/models while the scheduler is dead, so requests hang instead of
+# erroring — check the container log, not the health endpoint. This is the
+# assert upstream's MROPE-ANALYSIS.md describes ("firing in EAGLE speculative
+# prefill — next surgical fix is the position clamp, option 3"), reproduced on
+# a text-only request with their mrope t_mask patch already baked in. Candidate
+# next steps, none tried: (a) --disable-cuda-graph (upstream's "bulletproof"
+# fallback, ~55 tok/s, though prefill graphs were already off here);
+# (b) NEXTN off (--speculative-algorithm dropped) to isolate the draft-extend
+# path; (c) MiaAI's image qwen38-flashnext-dspark:local (same #36845 kernel,
+# their own mrope handling) with these flags.
+#
+# WHY THE IMAGE IS A LOCAL BUILD (docker/Dockerfile.qwen38fn-sm121-triton-varlen,
+# tag qwen38fn-sglang:sm121-triton-varlen-local, on BOTH nodes):
+# Upstream's live image (radixark/sglang-qwen38flashnext:sm121-qsa-mrope1, not
+# public) force-enables the FlashInfer TRT-LLM sparse-decode kernel on SM121.
+# Their 2026-08-28 verdict (sglang #36806, merged upstream): that kernel SILENTLY
+# corrupts long context on GB10 — token-0 ("!") garbage in 1/4 runs at 120K
+# tokens rising to 4/4 at 210K, HTTP 200 throughout, short requests clean. Their
+# staged successor starts from the public day-0 image lmsysorg/sglang:qwen38flashnext
+# (already on both nodes) and applies sglang PR #36845 — never TRT-LLM on SM121,
+# a Triton packed-varlen QSA decode kernel instead, validated upstream at 262K
+# with zero corruption (the same fix MiaAI's lane ports) — then their mrope
+# partial-rotary OOB fix (the vision CUDA device-side assert, Xid 43).
+# NCCL is bumped to 2.30.x in the image: the day-0 image bundles 2.29.7, and both
+# tonyd2wild (2.30.4 via LD_PRELOAD) and MiaAI (2.30.7) pin >= 2.30 for CUDA
+# graphs + TP on GB10/CX7. sparkrun cannot bind-mount a host copy, so the wheel
+# is upgraded inside the image.
+#
+# The four token-0 "!!!!" causes upstream catalogued, and how each is handled:
+#   1. TRT-LLM long-context corruption (#36806)  -> the Triton-varlen image above
+#   2. mamba/SSM state pool collapse under --disable-radix-cache (pool shrinks to
+#      max_running_requests; 6 concurrent agents exhaust it, every stream turns
+#      to "!!!!")                                  -> --max-mamba-cache-size 97
+#   3. thinking + tools + qwen3_coder parser (#36537) -> thinking OFF server-side
+#      (enable_thinking:false default); keep temperature <= 0.7; do NOT re-enable
+#      thinking per-request in sessions that carry tools until upstream fixes it
+#   4. mrope partial-rotary OOB on image input under CUDA graphs -> t_mask bound
+#      baked into the image (MROPE-ANALYSIS.md upstream)
+#
+# Landmines (upstream's, do not "clean up"):
+#   - page-size 64 (compressed QSA pins it); mamba-track-interval must be a
+#     multiple of 64 and >= the 4 draft tokens.
+#   - NEXTN 3 steps / topk 1 / 4 draft tokens: topk MUST be 1 (Qwen4-Exp PLE spec
+#     decode supports only topk=1).
+#   - --disable-radix-cache is part of the loop fix — hence the mamba pin.
+#   - --disable-prefill-cuda-graph (prefill graphs fail on SM121) and
+#     --disable-cuda-graph-padding (loop fix). Decode graphs ON (--cuda-graph-max-bs
+#     8) are what lift 55 -> 70 tok/s peak; if the mrope assert ever recurs, add
+#     --disable-cuda-graph (~55 peak, vision kept) rather than going text-only.
+#   - --sampling-backend pytorch: rules out the FlashInfer sampler arg-maxing a
+#     stale row to token 0.
+#   - --ple-offload-embedding: the 51B n-gram table lives in host RAM (row lookup,
+#     no decode cost). --max-total-tokens 600000 + mem-fraction 0.80 PIN the KV
+#     pool: GB10 is unified memory, and an unpinned pool (1.05M at 0.82) let page
+#     cache growth starve the GPU allocator -> NV_ERR_NO_MEMORY under load.
+#     Upstream drops page cache on both nodes before every launch
+#     (`sync; echo 3 | sudo tee /proc/sys/vm/drop_caches`) — do the same.
+#   - context stays native 262144. MiaAI YaRN-scales to 1M; upstream leaves it
+#     native (past 262K prefill time, not memory, is the limit on Spark).
+#
+# Local deviations from launch-qwen38fn-sglang-tp2.sh:
+#   - --allow-auto-truncate DROPPED: it silently truncates over-length prompts
+#     (MiaAI issue #8). Leo set ALLOW_AUTO_TRUNCATE=0 on the earlier SGLang lane,
+#     and LiteLLM caps max_input_tokens at 262144 anyway. Prefer the loud error.
+#   - docker --memory 110g / --restart unless-stopped are not expressible in a
+#     sparkrun recipe; nothing auto-restarts — relaunch with `make qwen38fn`.
+#   - NCCL_IB_HCA / NCCL_SOCKET_IFNAME / GLOO_SOCKET_IFNAME and the multi-node
+#     flags (--dist-init-addr/--nnodes/--node-rank) are per-host and injected by
+#     sparkrun (this pair is asymmetric: head on f0, worker on f1).
+#   - port 8000 (upstream also serves :8000; homelab convention).
+
+recipe_version: "2"
+name: Qwen3.8-Flash-Next-NVFP4
+model: RadixArk/Qwen3.8-Flash-Next-NVFP4
+runtime: sglang
+min_nodes: 2
+
+# Requires two Sparks (1 GB10 each -> tensor_parallel 2). Will not run solo.
+cluster_only: true
+
+# Local build — see the header and docker/Dockerfile.qwen38fn-sm121-triton-varlen.
+container: qwen38fn-sglang:sm121-triton-varlen-local
+
+# Upstream runs --shm-size 32g; sparkrun's default is smaller.
+executor_config:
+  shm_size: 32gb
+
+metadata:
+  description: Qwen3.8-Flash-Next NVFP4 (125B-A3B hybrid MoE, multimodal) on 2x DGX Spark GB10, SGLang TP=2, NEXTN spec decode + decode CUDA graphs, 262K ctx
+  maintainer: local (leo)
+  source: https://github.com/tonyd2wild/Qwen3.8-Flash-Next-NVFP4-DGX-Spark
+  base_model: Qwen/Qwen3.8-Flash-Next
+  model_dtype: nvfp4 (modelopt_fp4)
+  draft_method: NEXTN (in-checkpoint MTP head), 3 steps / topk 1 / 4 draft tokens
+  sglang_version: "lmsysorg/sglang:qwen38flashnext day-0 image + sglang PR #36845 + mrope fix (local build)"
+
+# Defaults — upstream launcher values verbatim except the port.
+defaults:
+  host: 0.0.0.0
+  port: 8000
+  served_model_name: qwen3.8-flash-next
+  tensor_parallel: 2
+  # --mem-fraction-static. 0.80 + the 600K pin below is the OOM-safe production
+  # profile; 0.82 unpinned reaches a 1.05M pool but OOMs under load (GB10 UMA).
+  gpu_memory_utilization: 0.80
+  # --context-length: native. Do not raise without YaRN overrides (see header).
+  max_model_len: 262144
+  max_total_tokens: 600000
+  max_running_requests: 6
+  chunked_prefill_size: 4096
+  page_size: 64
+  # Mamba/SSM state pool; MUST stay pinned while --disable-radix-cache is on.
+  max_mamba_cache_size: 97
+  cuda_graph_max_bs: 8
+  # Thinking OFF server-side (cause 3). A request can still opt in with
+  # chat_template_kwargs {"enable_thinking": true} — not in tool sessions.
+  chat_template_kwargs: '{"enable_thinking": false}'
+
+env:
+  # Mirrors recipes/qwen3.8-flash-next-sglang.env — keep the two in sync.
+  # Weights are pre-pulled by sparkrun on both nodes; never let the container
+  # reach out to the Hub on its own (126 GB).
+  HF_HUB_OFFLINE: '1'
+  TRANSFORMERS_OFFLINE: '1'
+  TORCH_CUDA_ARCH_LIST: '12.1a'
+  FLASHINFER_CUDA_ARCH_LIST: '12.1a'
+  # NCCL RoCE set — upstream launcher values (NB: CROSS_NIC=1 and the 4-channel
+  # pin are theirs; the inkling SGLang lane runs CROSS_NIC=0 — both are field-
+  # tested on GB10+CX7 pairs, this lane follows its source).
+  NCCL_NET: IB
+  NCCL_IB_DISABLE: '0'
+  NCCL_IB_GID_INDEX: '3'
+  NCCL_MAX_NCHANNELS: '4'
+  NCCL_MIN_NCHANNELS: '4'
+  NCCL_CROSS_NIC: '1'
+  NCCL_CUMEM_ENABLE: '0'
+  NCCL_IGNORE_CPU_AFFINITY: '1'
+  NCCL_DEBUG: WARN
+  TORCH_NCCL_ASYNC_ERROR_HANDLING: '1'
+
+# Serve command — launch-qwen38fn-sglang-tp2.sh verbatim (minus the deviations
+# in the header), adapted to sparkrun placeholders. The sglang runtime appends
+# --dist-init-addr/--nnodes/--node-rank per node — do not hand-add them.
+command: |
+  python3 -m sglang.launch_server \
+    --model-path {model} \
+    --served-model-name {served_model_name} \
+    --host {host} --port {port} \
+    --tp-size {tensor_parallel} \
+    --trust-remote-code \
+    --quantization modelopt_fp4 \
+    --fp4-gemm-backend flashinfer_cutlass \
+    --page-size {page_size} \
+    --mamba-scheduler-strategy extra_buffer \
+    --mamba-track-interval 64 \
+    --max-mamba-cache-size {max_mamba_cache_size} \
+    --speculative-algorithm NEXTN \
+    --speculative-num-steps 3 \
+    --speculative-eagle-topk 1 \
+    --speculative-num-draft-tokens 4 \
+    --enable-linear-replayssm-spec \
+    --speculative-attention-mode decode \
+    --chunked-prefill-size {chunked_prefill_size} \
+    --max-running-requests {max_running_requests} \
+    --context-length {max_model_len} \
+    --max-total-tokens {max_total_tokens} \
+    --mem-fraction-static {gpu_memory_utilization} \
+    --reasoning-parser auto \
+    --tool-call-parser qwen3_coder \
+    --default-chat-template-kwargs '{chat_template_kwargs}' \
+    --ple-offload-embedding \
+    --cuda-graph-max-bs {cuda_graph_max_bs} \
+    --disable-cuda-graph-padding \
+    --disable-prefill-cuda-graph \
+    --disable-radix-cache \
+    --sampling-backend pytorch

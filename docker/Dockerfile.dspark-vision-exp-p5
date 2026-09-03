@@ -1,0 +1,35 @@
+# Patch 5 (suppress client stop strings inside the reasoning segment) on top of
+# the Vision-Exp image, for the deepseek lane. Adopted 2026-09-03 from upstream
+# main @ 9bf6e53 of
+# https://github.com/tonyd2wild/DeepSeek-v4-Flash-Vision-Exp-DSpark-1M-NVFP4-KV-2x-DGX-Spark
+# (patches/0005-suppress-stops-in-reasoning.patch — PR #21 by Capicua25x, plus
+# the #42 output-side arming by Mcray4; vendored at recipes/mods/vision-exp/).
+#
+# WHY: vLLM's v1 detokenizer checks client `stop` strings against the whole
+# output stream. With think-in-prompt templates (DeepSeek V4) generation starts
+# INSIDE the reasoning segment, and chain-of-thought naturally restates phrases
+# a harness sends as stop sequences — the request dies mid-<think>, </think>
+# never arrives, and the reasoning parser yields content = null. Hosted
+# deployments scope stops to content; this patch closes that gap. Per-request
+# guard, arms only when the request carries stop strings AND the prompt ends
+# with (or the model opens with) the reasoning start marker; EOS/max_tokens and
+# non-thinking requests are untouched. Opt-out: VLLM_SUPPRESS_STOPS_IN_REASONING=0.
+#
+# The image has no `patch`/`git`, so the patched file is vendored whole:
+# recipes/mods/vision-exp/detokenizer_p5.py = this image family's own
+# vllm/v1/engine/detokenizer.py (vLLM 0.21.1rc1.dev339, the tree the .patch was
+# written for) + the .patch, applied on the host 2026-09-03 (clean, no fuzz).
+# Re-derive after any base-image change:
+#   docker cp <ctr>:/opt/env/lib/python3.12/site-packages/vllm/v1/engine/detokenizer.py vllm/v1/engine/
+#   patch -p1 < recipes/mods/vision-exp/0005-suppress-stops-in-reasoning.patch
+#
+# Build on BOTH nodes (context = ~/sparkrun-recipes), AFTER
+# docker/Dockerfile.dspark-vision-exp:
+#   docker build -f docker/Dockerfile.dspark-vision-exp-p5 \
+#     -t vllm-dspark-runtime:dspark-nvfp4-vision-exp-p5 ~/sparkrun-recipes
+FROM vllm-dspark-runtime:dspark-nvfp4-vision-exp
+COPY recipes/mods/vision-exp/detokenizer_p5.py /opt/env/lib/python3.12/site-packages/vllm/v1/engine/detokenizer.py
+# fail the build, not the first boot, if the file is broken or the guard is missing
+RUN /opt/env/bin/python -m py_compile /opt/env/lib/python3.12/site-packages/vllm/v1/engine/detokenizer.py \
+ && grep -q "VLLM_SUPPRESS_STOPS_IN_REASONING" /opt/env/lib/python3.12/site-packages/vllm/v1/engine/detokenizer.py \
+ && find /opt/env/lib/python3.12/site-packages/vllm/v1/engine -name __pycache__ -type d -prune -exec rm -rf {} + || true
