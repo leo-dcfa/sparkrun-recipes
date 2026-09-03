@@ -97,6 +97,21 @@
 # lane (their 54.6 vs ~70-80 on count) — known, attributed to per-step cost
 # (raw-input-ids pass + resident ViT), not speculation.
 #
+# A/B 2026-09-03 vs MiaAI-Lab's compose lane (ghcr.io/anemll/dspark-vllm-gx10:0.1.1
+# + ~25 start-time hotfixes, k=6, --moe-backend flashinfer_b12x, full+piecewise
+# CUDA graphs, gmu 0.835; clone at ~/src/miaai-ds4-dspark with a working
+# .env.dspark for this pair; start/stop with their scripts, NOT sparkrun — the
+# 2026-07-23 sparkrun port of it garbled). Same checkpoint, same nvfp4 KV, so
+# lossless either way. llama-benchy, TypeScript corpus, pp 2048 / tg 128,
+# thinking off, warm (this lane / MiaAI):
+#   C1 33.2 / 37.3 (+12%)   C2 53.7 / 48.6 (-9%)   C6 61.5 / 56.9 (-7%)
+#   32K C1 38.7 / 42.4 (+9%)   prefill 1653 / 1496 t/s   their KV pool 2.31M
+# Their first cold C1 cell read 10.6 — that image JIT-compiles shapes on first
+# use (they ship scripts/boot-shape-warmup.sh); warm the engine before judging
+# it. Verdict: mixed, kept THIS lane (sparkrun/dashboard-integrated, better
+# under concurrency and on prefill). Their README's 62-83 tok/s is not this
+# corpus. Results: ~/bench/deepseek-vision-exp-miaai-k6*.json.
+#
 # NOT taken from the 2026-09-03 resync, and why:
 #   * fix(nvfp4) #37 (widen the decode dispatch in flashmla_sparse.py to
 #     nvfp4_ds_mla) targets their official-main port. The stage-c family here
