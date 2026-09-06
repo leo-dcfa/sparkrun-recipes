@@ -1,11 +1,7 @@
 # Makefile — convenience wrappers around `sparkrun run` for the recipes Leo runs
 # day-to-day on the 2x DGX Spark (GB10) homelab.
 #
-# make hy3                              # launch Hy3-295B NVFP4-W4A16 + MTP (local)
 # make deepseek                         # launch DeepSeek-V4-Flash-Vision-Exp (native vision) + DSpark, NVFP4 KV, 1M ctx (local)
-# make mimo                             # launch MiMo-V2.5 NVFP4 Omni (multimodal), 1M ctx (local, 2-node)
-# make inkling                          # launch TML Inkling-Small NVFP4 (multimodal MoE), SGLang+DSpark, 1M ctx (local, 2-node)
-# make step                             # launch Step-3.7-Flash NVFP4, 256K ctx (local, 2-node)
 # make glm                              # launch GLM-5.3-Flash NVFP4 + DFlash2 k=7 spec decode (320B/18B-A multimodal MoE)
 # make qwen38fn                         # launch Qwen3.8-Flash-Next NVFP4, SGLang TP2 + NEXTN spec decode, 262K ctx (local, 2-node)
 # make deepseek MAX_MODEL_LEN=500000    # override context length
@@ -32,9 +28,14 @@ export PATH := $(HOME)/.local/bin:$(PATH)
 # (Spark Qwen lanes retired 2026-07-24 — were @official/qwen3.6-27b-fp8-mtp-vllm
 # and recipes/qwen3.6-35b-a3b-nvfp4-fast.yaml; the yaml stays in recipes/ for reference.
 #  Qwen3.8-Flash-Next came back 2026-09-03 as `make qwen38fn`, see below.)
+# (Hy3-295B, MiMo-V2.5 Omni, Inkling-Small (+ the inkling-eugr spark-vllm-docker
+#  fallback) and Step-3.7-Flash retired 2026-09-04 — Leo stopped using them.
+#  Were recipes/hy3-295b-nvfp4.yaml, recipes/mimo-v2.5-omni.yaml,
+#  recipes/inkling-small-nvfp4.yaml (+ ~/spark-vllm-docker) and
+#  recipes/step-3.7-flash-nvfp4.yaml; the yamls stay in recipes/ for reference,
+#  the targets are in git history. LiteLLM entries removed the same day.)
 
 # Local recipes (this repo) — run by file path, no registry needed.
-HY3_RECIPE            := recipes/hy3-295b-nvfp4.yaml
 # DeepSeek-V4-Flash-Vision-Exp (native image input) + DSpark — tonyd2wild's
 # vision port, adopted 2026-09-01 from the vision-exp-default branch of the
 # (renamed) upstream repo. Same LM as 0731 with a 3-layer drafter (k=5)
@@ -67,21 +68,6 @@ DEEPSEEK_RECIPE       := recipes/deepseek-v4-flash-vision-exp.yaml
 #  image glm53-flash-sm121:v8 with LibertAIDAI weights. recipes/glm-5.3-flash-nvfp4.yaml
 #  and that image are both kept for rollback — point GLM_RECIPE back at the yaml.)
 GLM_RECIPE            := recipes/glm-5.3-flash-dflash2.yaml
-# MiMo-V2.5 NVFP4 Omni (multimodal) — MiaAI's dual-Spark Ray deploy, 1M ctx.
-# Replaces the never-wired mimo-v2.5-dflash.yaml as the MiMo entry point.
-MIMO_RECIPE            := recipes/mimo-v2.5-omni.yaml
-# TML Inkling-Small NVFP4 (276B-A12B multimodal MoE) — MiaAI/drowzeys SGLang +
-# DSpark champion lane, 1M ctx (adopted 2026-08-06, unverified on this host;
-# see the yaml header for the pull-both-models/pull-image prep). The old parked
-# vLLM lane is kept at recipes/inkling-small-nvfp4.yaml.vllm-parked; eugr's
-# spark-vllm-docker deploy (256K ctx) stays available as `make inkling-eugr`
-# until this lane is verified.
-INKLING_RECIPE         := recipes/inkling-small-nvfp4.yaml
-INKLING_DEPLOY_DIR     := $(HOME)/spark-vllm-docker
-# StepFun Step-3.7-Flash NVFP4 — MiaAI's dual-Spark no-MTP lane, 256K ctx
-# (adopted 2026-08-06, unverified on this host). Needs the local image built on
-# BOTH nodes first: see docker/Dockerfile.stepfun37-procps.
-STEP_RECIPE            := recipes/step-3.7-flash-nvfp4.yaml
 # Qwen3.8-Flash-Next NVFP4 (125B-A3B hybrid MoE + 51B PLE + MTP head,
 # multimodal) — tonyd2wild's SGLang TP2 lane (NEXTN spec decode, decode CUDA
 # graphs, 600K-token KV pin, thinking OFF server-side), adopted 2026-09-03 on
@@ -111,10 +97,13 @@ endif
 
 RUN := $(SPARKRUN) run --cluster $(CLUSTER)
 
-.PHONY: help hy3 deepseek glm mimo inkling inkling-eugr step qwen38fn \
-        hy3-dry deepseek-dry glm-dry mimo-dry inkling-dry step-dry qwen38fn-dry \
-        stop stop-hy3 stop-deepseek stop-glm stop-mimo stop-inkling stop-step stop-qwen38fn \
-        status logs list
+# The worker node (node_1), addressed over the cluster link the way sparkrun does.
+WORKER ?= 10.100.200.1
+
+.PHONY: help deepseek glm qwen38fn \
+        deepseek-dry glm-dry qwen38fn-dry \
+        stop stop-deepseek stop-glm stop-qwen38fn \
+        status logs list flush patch-sparkrun
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z0-9_-]+:.*?## ' $(MAKEFILE_LIST) | \
@@ -122,34 +111,46 @@ help: ## Show this help
 
 ## --- launch ---------------------------------------------------------------
 
-hy3: ## Launch Hy3-295B NVFP4-W4A16 + MTP (local, 2-node)
-	$(RUN) $(HY3_RECIPE) $(OVERRIDES)
-
 deepseek: ## Launch DeepSeek-V4-Flash-Vision-Exp + DSpark k=5 (tonyd2wild vision port, 2-node, NVFP4 KV, 1M ctx)
 	$(RUN) $(DEEPSEEK_RECIPE) $(OVERRIDES)
 
-glm: ## Launch GLM-5.3-Flash NVFP4 + DFlash2 k=7 spec decode (local, 2-node, 256K ctx)
+# `flush` first, since 2026-09-05: NVRM refused part of the 6 GiB KV carve-out at
+# boot (dmesg: NV_ERR_NO_MEMORY from _memdescAllocInternal @ mem_desc.c:1359, one
+# second before vLLM logged "reserved 6.0 GiB memory for KV Cache") on nodes whose
+# page cache had not been dropped. (vLLM's own "Available RAM: ~20 GiB" line at
+# weight-load start is NOT evidence of that — it prints the same figure flushed or
+# not; read /proc/meminfo instead.) vLLM does not notice: it served short prompts for 4.5 h, then the
+# first ~25K-context decode stalled (`RPC call to sample_tokens timed out`, no
+# traceback on either rank, worker rank 3 GB into swap). Upstream's KV-hunt record
+# calls this the phantom reserve; its rule is drop_caches on every rank right
+# before launch. After a launch, `sudo dmesg -T | grep NV_ERR_NO_MEMORY` must be
+# clean at the "reserved" second and a >=28K-token prompt must pass — a short
+# prompt cannot see this. If NVRM still refuses, the next lever is the pin itself:
+# kv_cache_memory 5905580032 (5.5 GiB, upstream's stable TP2 record) in the yaml.
+#
+# `patch-sparkrun` too, since 2026-09-05: the relaunch after that stall failed in
+# gloo's first barrier, and the reason turned out to be the control plane, not
+# memory. sparkrun puts the torch master address AND every host's GLOO/NCCL/TP
+# socket pin on the default-route interface — here wlP9s9, because the 10GbE
+# ports have no carrier — and the Optus mesh black-holes Spark<->Spark Wi-Fi
+# after a roam (ARP for the peer resolves to the satellite's MAC; 100% loss on
+# 192.168.0.x while 10.100.200.x is clean). vLLM's own get_ip() follows the
+# default route too (the engine core's mq_connect_ip: scheduler broadcast and
+# worker responses), so moving only master-addr/gloo left a launch hanging
+# silently after "reserved 6.0 GiB". tools/patch_sparkrun_wifi.py makes
+# sparkrun's two detect scripts substitute the up RDMA netdev for a wireless
+# default interface and its env builder emit VLLM_HOST_IP per host, so the whole
+# control plane rides the CX7 link like NCCL already does. Verify after a launch:
+#   docker inspect <node_0> | grep -E "VLLM_HOST_IP|GLOO_SOCKET_IFNAME" -> 10.100.200.2 / enp1s0f0np0
+#   grep mq_connect_ip /tmp/sparkrun_serve.log (in-container)         -> 10.100.200.2, not 192.168.0.120
+# Cabling the 10GbE ports would make the patch redundant (wired default route).
+glm: flush patch-sparkrun ## Launch GLM-5.3-Flash NVFP4 + DFlash2 k=7 spec decode (local, 2-node, 256K ctx)
 	$(RUN) $(GLM_RECIPE) $(OVERRIDES)
-
-mimo: ## Launch MiMo-V2.5 NVFP4 Omni multimodal (local, 2-node, 450K ctx)
-	$(RUN) $(MIMO_RECIPE) $(OVERRIDES)
-
-inkling: ## Launch TML Inkling-Small NVFP4 multimodal MoE (local, 2-node, SGLang+DSpark, 1M ctx)
-	$(RUN) $(INKLING_RECIPE) $(OVERRIDES)
-
-inkling-eugr: ## Launch Inkling via eugr spark-vllm-docker fallback (2-node, 256K ctx)
-	cd $(INKLING_DEPLOY_DIR) && ./run-recipe.sh inkling-small-nvfp4 -- --served-model-name inkling-small
-
-step: ## Launch Step-3.7-Flash NVFP4 (local, 2-node, 256K ctx, MiaAI no-MTP lane)
-	$(RUN) $(STEP_RECIPE) $(OVERRIDES)
 
 qwen38fn: ## Launch Qwen3.8-Flash-Next NVFP4 (local, 2-node, SGLang TP2 + NEXTN, 262K ctx, tonyd2wild lane)
 	$(RUN) $(QWEN38FN_RECIPE) $(OVERRIDES)
 
 ## --- dry-run / VRAM fit estimate (no launch) ------------------------------
-
-hy3-dry: ## Estimate VRAM/context fit for Hy3-295B NVFP4-W4A16
-	$(RUN) $(HY3_RECIPE) $(OVERRIDES) --dry-run
 
 deepseek-dry: ## Estimate VRAM/context fit for DeepSeek-V4-Flash-Vision-Exp + DSpark
 	$(RUN) $(DEEPSEEK_RECIPE) $(OVERRIDES) --dry-run
@@ -157,44 +158,27 @@ deepseek-dry: ## Estimate VRAM/context fit for DeepSeek-V4-Flash-Vision-Exp + DS
 glm-dry: ## Estimate VRAM/context fit for GLM-5.3-Flash NVFP4 + DFlash2
 	$(RUN) $(GLM_RECIPE) $(OVERRIDES) --dry-run
 
-mimo-dry: ## Estimate VRAM/context fit for MiMo-V2.5 NVFP4 Omni
-	$(RUN) $(MIMO_RECIPE) $(OVERRIDES) --dry-run
-
-inkling-dry: ## Estimate VRAM/context fit for TML Inkling-Small NVFP4 (SGLang+DSpark lane)
-	$(RUN) $(INKLING_RECIPE) $(OVERRIDES) --dry-run
-
-step-dry: ## Estimate VRAM/context fit for Step-3.7-Flash NVFP4
-	$(RUN) $(STEP_RECIPE) $(OVERRIDES) --dry-run
-
 qwen38fn-dry: ## Estimate VRAM/context fit for Qwen3.8-Flash-Next NVFP4
 	$(RUN) $(QWEN38FN_RECIPE) $(OVERRIDES) --dry-run
 
 ## --- lifecycle ------------------------------------------------------------
 
-stop: ## Stop all workloads on the cluster (sparkrun + inkling eugr lanes)
-	$(SPARKRUN) stop --all --cluster $(CLUSTER)
-	@docker stop vllm_node >/dev/null 2>&1 && echo "stopped eugr vllm_node (head)" || true
-	@ssh 10.100.200.1 "docker stop vllm_node" >/dev/null 2>&1 && echo "stopped eugr vllm_node (worker)" || true
+patch-sparkrun: ## Keep sparkrun's torch/gloo control plane off Wi-Fi (idempotent; re-run after `sparkrun update`)
+	python3 tools/patch_sparkrun_wifi.py
 
-stop-hy3: ## Stop just the Hy3-295B NVFP4 workload
-	$(SPARKRUN) stop $(HY3_RECIPE) --cluster $(CLUSTER)
+flush: ## Drop the page cache on both nodes (GB10 UMA: NVRM needs physically free memory for the KV slab)
+	sync; echo 3 | sudo -n tee /proc/sys/vm/drop_caches >/dev/null
+	ssh -o BatchMode=yes -o ConnectTimeout=10 $(WORKER) 'sync; echo 3 | sudo -n tee /proc/sys/vm/drop_caches >/dev/null'
+	@echo "MemAvailable after flush:"; grep MemAvailable /proc/meminfo; ssh -o BatchMode=yes $(WORKER) grep MemAvailable /proc/meminfo
+
+stop: ## Stop all workloads on the cluster
+	$(SPARKRUN) stop --all --cluster $(CLUSTER)
 
 stop-deepseek: ## Stop just the DeepSeek-V4-Flash-Vision-Exp + DSpark workload
 	$(SPARKRUN) stop $(DEEPSEEK_RECIPE) --cluster $(CLUSTER)
 
 stop-glm: ## Stop just the GLM-5.3-Flash NVFP4 + DFlash2 workload
 	$(SPARKRUN) stop $(GLM_RECIPE) --cluster $(CLUSTER)
-
-stop-mimo: ## Stop just the MiMo-V2.5 NVFP4 Omni workload
-	$(SPARKRUN) stop $(MIMO_RECIPE) --cluster $(CLUSTER)
-
-stop-inkling: ## Stop just the Inkling-Small NVFP4 workload (sparkrun lane + eugr vllm_node fallback)
-	-$(SPARKRUN) stop $(INKLING_RECIPE) --cluster $(CLUSTER)
-	@docker stop vllm_node >/dev/null 2>&1 && echo "stopped eugr vllm_node (head)" || true
-	@ssh 10.100.200.1 "docker stop vllm_node" >/dev/null 2>&1 && echo "stopped eugr vllm_node (worker)" || true
-
-stop-step: ## Stop just the Step-3.7-Flash NVFP4 workload
-	$(SPARKRUN) stop $(STEP_RECIPE) --cluster $(CLUSTER)
 
 stop-qwen38fn: ## Stop just the Qwen3.8-Flash-Next NVFP4 workload
 	$(SPARKRUN) stop $(QWEN38FN_RECIPE) --cluster $(CLUSTER)
