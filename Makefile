@@ -3,7 +3,7 @@
 #
 # make deepseek                         # launch DeepSeek-V4-Flash-Vision-Exp (native vision) + DSpark, NVFP4 KV, 1M ctx (local)
 # make glm                              # launch GLM-5.3-Flash NVFP4 + DFlash2 k=7 spec decode (320B/18B-A multimodal MoE)
-# make qwen38fn                         # launch Qwen3.8-Flash-Next NVFP4, SGLang TP2 + NEXTN spec decode, 262K ctx (local, 2-node)
+# make qwen38fn                         # launch Qwen3.8-Flash-Next NVFP4, MiaAI vLLM TP2+EP+MTP3 kit, 262K ctx (2-node, NOT sparkrun)
 # make deepseek MAX_MODEL_LEN=500000    # override context length
 # make deepseek-dry                     # VRAM/fit estimate, no launch
 # make stop                             # stop everything on the cluster
@@ -69,17 +69,48 @@ DEEPSEEK_RECIPE       := recipes/deepseek-v4-flash-vision-exp.yaml
 #  and that image are both kept for rollback — point GLM_RECIPE back at the yaml.)
 GLM_RECIPE            := recipes/glm-5.3-flash-dflash2.yaml
 # Qwen3.8-Flash-Next NVFP4 (125B-A3B hybrid MoE + 51B PLE + MTP head,
-# multimodal) — tonyd2wild's SGLang TP2 lane (NEXTN spec decode, decode CUDA
-# graphs, 600K-token KV pin, thinking OFF server-side), adopted 2026-09-03 on
-# their STAGED Triton-varlen image built locally on BOTH nodes
-# (docker/Dockerfile.qwen38fn-sm121-triton-varlen -> qwen38fn-sglang:
-# sm121-triton-varlen-local). UNVERIFIED on this host beyond the image build and
-# a dry run — see the yaml header for upstream's promotion checklist and the
-# history of the two earlier (non-Makefile) Qwen3.8-Flash-Next lanes; the
-# hand-run vLLM launcher at ~/src/qwen38-flashnext-vllm stays the fallback.
-# Upstream drops page cache on both nodes before launch (GB10 UMA):
-#   sync; echo 3 | sudo tee /proc/sys/vm/drop_caches   (head AND worker)
-QWEN38FN_RECIPE        := recipes/qwen3.8-flash-next-sglang.yaml
+# multimodal) — MiaAI-Lab's vLLM TP2+EP+MTP3 kit, adopted 2026-09-06 @ c2325b2
+# (github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Dual-DGX-Sparks; clone + this pair's
+# .env at ~/src/qwen38-flashnext-miaai-vllm — the .env header explains every
+# local value). NOT a sparkrun recipe: the kit bind-mounts runtime patches
+# (PLE FP8 resolver shim, MXFP8 kernel fallback, FP8-block MoE dispatch, MTP
+# layer-index alias) that sparkrun cannot express, so it runs its own
+# start.sh/stop.sh — docker per node over SSH, VLLM_HOST_IP + GLOO/NCCL/TP
+# socket ifnames pinned per node to the CX7 link (the Wi-Fi control-plane
+# problem `patch-sparkrun` exists for does not arise here). Same day-0 image
+# vllm/vllm-openai:qwen38-flash-next (sha256 d464f3b4, identical on both nodes
+# and identical to the one MiaAI measured on) and the RadixArk checkpoint both
+# nodes already hold. MiaAI's numbers on 2x GB10, TP2+EP, MTP3, 262K: ~52 tok/s
+# batch-1 (24.5 without MTP), 72.8% draft acceptance, ~2.9K tok/s prefill flat
+# to 128K, x6 aggregate ~170 tok/s, ~11 min cold boot.
+# Local deviations (all in the .env): gmu 0.80 (kit 0.835), 6 seqs (kit 8),
+# bf16 KV (kit flipped its default to fp8 on 2026-09-05 — capacity we do not
+# need at 262K x 6 and a quality trade on sparse attention), native 262K with
+# YaRN off, port 8000. VERIFIED on this pair 2026-09-06, first launch (log:
+# ~/bench/qwen38fn-miaai-20260906.launch.log): boot 13 min (weights 469 s +
+# MTP drafter 75 s, engine init 141 s, graphs 4 s), 65.4 GiB weights/node,
+# KV 29.77 GiB = 1,880,351 tokens = 7.17x at 262K, zero NV_ERR_NO_MEMORY, no
+# MXFP8 fallback lines (RadixArk attention is BF16, so that patch is inert
+# here), control plane on the CX7 link (VLLM_HOST_IP 10.100.200.2,
+# *_SOCKET_IFNAME enp1s0f0np0). Through the LiteLLM proxy: thinking-on answer
+# with reasoning_content, count-to-300 at 64.8 tok/s incl. prefill (ceiling
+# prompt, thinking off), get_weather tool call parsed, red-square image ->
+# "Red", 62K-token needle prompt answered correctly in 21.8 s (~2.9K tok/s
+# prefill). MTP after those requests: 1134/1155 drafted tokens accepted, per
+# position 382/378/374 of 385 drafts (decaying = drafter wired right; the
+# count prompt inflates it, expect MiaAI's ~73% on real prompts). The boot log
+# offers --kv-cache-memory=31601006183 (29.43 GiB) as the exact-fit pin.
+# Supersedes tonyd2wild's SGLang lane (recipes/qwen3.8-flash-next-sglang.yaml,
+# adopted 2026-09-03): it boots and then dies on the first >=2K-token prefill
+# (mrope device-side assert in EAGLE draft-extend; ~/bench/qwen38fn-crash-
+# 20260903.log), and tonyd2wild DELETED that lane upstream on 2026-09-05 —
+# their repo is now vLLM-only too. Kept as `make qwen38fn-sglang` for
+# reference. The getrefined hand launcher at ~/src/qwen38-flashnext-vllm is
+# the older single-file version of the same vLLM stack (the MiaAI kit is
+# based on it) and is no longer needed as a fallback.
+# Upstream drops page cache on both nodes before launch (GB10 UMA) — `flush`.
+QWEN38FN_DIR           := $(HOME)/src/qwen38-flashnext-miaai-vllm
+QWEN38FN_SGLANG_RECIPE := recipes/qwen3.8-flash-next-sglang.yaml
 
 # Optional overrides — set on the command line, e.g.
 # make deepseek MAX_MODEL_LEN=1000000 GPU_MEM=0.85
@@ -100,10 +131,10 @@ RUN := $(SPARKRUN) run --cluster $(CLUSTER)
 # The worker node (node_1), addressed over the cluster link the way sparkrun does.
 WORKER ?= 10.100.200.1
 
-.PHONY: help deepseek glm qwen38fn \
+.PHONY: help deepseek glm qwen38fn qwen38fn-sglang \
         deepseek-dry glm-dry qwen38fn-dry \
-        stop stop-deepseek stop-glm stop-qwen38fn \
-        status logs list flush patch-sparkrun
+        stop stop-deepseek stop-glm stop-qwen38fn stop-qwen38fn-sglang \
+        status logs logs-qwen38fn list flush patch-sparkrun
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z0-9_-]+:.*?## ' $(MAKEFILE_LIST) | \
@@ -147,8 +178,11 @@ deepseek: ## Launch DeepSeek-V4-Flash-Vision-Exp + DSpark k=5 (tonyd2wild vision
 glm: flush patch-sparkrun ## Launch GLM-5.3-Flash NVFP4 + DFlash2 k=7 spec decode (local, 2-node, 256K ctx)
 	$(RUN) $(GLM_RECIPE) $(OVERRIDES)
 
-qwen38fn: ## Launch Qwen3.8-Flash-Next NVFP4 (local, 2-node, SGLang TP2 + NEXTN, 262K ctx, tonyd2wild lane)
-	$(RUN) $(QWEN38FN_RECIPE) $(OVERRIDES)
+qwen38fn: flush ## Launch Qwen3.8-Flash-Next NVFP4 (MiaAI vLLM TP2+EP+MTP3 kit, 2-node, 262K ctx, bf16 KV)
+	cd $(QWEN38FN_DIR) && ./start.sh --launch
+
+qwen38fn-sglang: ## PARKED — tonyd2wild SGLang lane (dies on first real prefill); reference only
+	$(RUN) $(QWEN38FN_SGLANG_RECIPE) $(OVERRIDES)
 
 ## --- dry-run / VRAM fit estimate (no launch) ------------------------------
 
@@ -158,8 +192,8 @@ deepseek-dry: ## Estimate VRAM/context fit for DeepSeek-V4-Flash-Vision-Exp + DS
 glm-dry: ## Estimate VRAM/context fit for GLM-5.3-Flash NVFP4 + DFlash2
 	$(RUN) $(GLM_RECIPE) $(OVERRIDES) --dry-run
 
-qwen38fn-dry: ## Estimate VRAM/context fit for Qwen3.8-Flash-Next NVFP4
-	$(RUN) $(QWEN38FN_RECIPE) $(OVERRIDES) --dry-run
+qwen38fn-dry: ## Preflight the MiaAI Qwen3.8 kit: .env, worker SSH, weights on both nodes (no launch)
+	cd $(QWEN38FN_DIR) && ./start.sh --no-download --no-launch && ./check-weights.sh
 
 ## --- lifecycle ------------------------------------------------------------
 
@@ -171,8 +205,9 @@ flush: ## Drop the page cache on both nodes (GB10 UMA: NVRM needs physically fre
 	ssh -o BatchMode=yes -o ConnectTimeout=10 $(WORKER) 'sync; echo 3 | sudo -n tee /proc/sys/vm/drop_caches >/dev/null'
 	@echo "MemAvailable after flush:"; grep MemAvailable /proc/meminfo; ssh -o BatchMode=yes $(WORKER) grep MemAvailable /proc/meminfo
 
-stop: ## Stop all workloads on the cluster
+stop: ## Stop all workloads on the cluster (sparkrun lanes + the MiaAI vllm-fn lane)
 	$(SPARKRUN) stop --all --cluster $(CLUSTER)
+	-cd $(QWEN38FN_DIR) && ./stop.sh
 
 stop-deepseek: ## Stop just the DeepSeek-V4-Flash-Vision-Exp + DSpark workload
 	$(SPARKRUN) stop $(DEEPSEEK_RECIPE) --cluster $(CLUSTER)
@@ -180,11 +215,16 @@ stop-deepseek: ## Stop just the DeepSeek-V4-Flash-Vision-Exp + DSpark workload
 stop-glm: ## Stop just the GLM-5.3-Flash NVFP4 + DFlash2 workload
 	$(SPARKRUN) stop $(GLM_RECIPE) --cluster $(CLUSTER)
 
-stop-qwen38fn: ## Stop just the Qwen3.8-Flash-Next NVFP4 workload
-	$(SPARKRUN) stop $(QWEN38FN_RECIPE) --cluster $(CLUSTER)
+stop-qwen38fn: ## Stop just the Qwen3.8-Flash-Next workload (MiaAI kit: vllm-fn on both nodes)
+	cd $(QWEN38FN_DIR) && ./stop.sh
 
-status: ## Show running sparkrun containers
+stop-qwen38fn-sglang: ## Stop the parked SGLang Qwen3.8 lane
+	$(SPARKRUN) stop $(QWEN38FN_SGLANG_RECIPE) --cluster $(CLUSTER)
+
+status: ## Show running sparkrun containers (+ the MiaAI vllm-fn containers, if any)
 	$(SPARKRUN) status --cluster $(CLUSTER)
+	@docker ps --filter name=vllm-fn --format 'vllm-fn (head):   {{.Status}}  {{.Image}}' 2>/dev/null || true
+	@ssh -o BatchMode=yes -o ConnectTimeout=5 $(WORKER) "docker ps --filter name=vllm-fn --format 'vllm-fn (worker): {{.Status}}  {{.Image}}'" 2>/dev/null || true
 
 logs: ## Tail the running workload's logs (or a specific one: make logs TARGET=<job-id|recipe>)
 	@target="$(TARGET)"; \
@@ -198,6 +238,9 @@ logs: ## Tail the running workload's logs (or a specific one: make logs TARGET=<
 	fi; \
 	echo "sparkrun logs $$target"; \
 	$(SPARKRUN) logs $$target
+
+logs-qwen38fn: ## Tail the MiaAI Qwen3.8 head container (the kit is not a sparkrun job, so `make logs` cannot see it)
+	docker logs -f vllm-fn
 
 list: ## List available recipes
 	$(SPARKRUN) list

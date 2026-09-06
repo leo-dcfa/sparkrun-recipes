@@ -31,6 +31,12 @@
 # pool, boot line must read "Mamba Cache is allocated ... 97"); (3) an image
 # request (mrope path).
 #
+# PARKED 2026-09-06 — superseded as `make qwen38fn` by MiaAI-Lab's vLLM TP2+EP+MTP3
+# kit (~/src/qwen38-flashnext-miaai-vllm, see the Makefile). Upstream tonyd2wild
+# DELETED this SGLang lane on 2026-09-05 (their repo is vLLM-only now), so the
+# crash below will not be fixed there. Reachable as `make qwen38fn-sglang` for
+# reference only.
+#
 # STATUS 2026-09-03 — BOOTS, THEN CRASHES ON THE FIRST REAL PREFILL. DO NOT USE
 # UNTIL FIXED. Booted cleanly here (all upstream receipts present: "sglang is
 # using nccl==2.30.7", "Mamba Cache is allocated. max_mamba_cache_size: 97",

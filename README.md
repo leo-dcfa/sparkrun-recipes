@@ -365,6 +365,79 @@ Launch: `make qwen35` (single node, TP=1); fit-check: `make qwen35-dry`.
   reads). This NVFP4-Fast recipe is the speed end of that curve; the FP8
   official recipes are the quality end.
 
+## qwen3.8-flash-next — MiaAI vLLM kit (`make qwen38fn`) — caveats
+
+Adopted 2026-09-06 from
+[MiaAI-Lab/Qwen3.8-Flash-Next-Dual-DGX-Sparks](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Dual-DGX-Sparks)
+@ `c2325b2` (their 2026-08-31 rewrite from SGLang to **vLLM TP2 + EP + MTP3**, plus
+the 2026-09-05 FP8-KV / reduced-vocab-drafting release). It replaces the parked
+tonyd2wild SGLang recipe below, which crashes on the first real prefill. **Not a
+sparkrun recipe** — clone + this pair's `.env` live at
+`~/src/qwen38-flashnext-miaai-vllm`; the Makefile target just runs their
+`start.sh --launch` after `flush`. **Verified on this host 2026-09-06** (first launch;
+the no-launch preflight had already confirmed weights + SSH + image on both nodes and all
+four patch generators against the local image, byte-identical to MiaAI's `d464f3b4`):
+boot 13 min, KV 29.77 GiB = 1.88M tokens (7.17x at 262K), and through the proxy a
+thinking-on answer, a parsed tool call, a red-square image read, a 62K-token needle found
+in 21.8 s and count-to-300 at 64.8 tok/s. Log: `~/bench/qwen38fn-miaai-20260906.launch.log`.
+
+- **Why it is not a recipe:** the kit bind-mounts four runtime patches over the
+  image (PLE FP8 resolver shim, MXFP8 kernel fallback for `[48,2560]` +
+  `visual.*`, FP8-block MoE dispatch for the MTP experts, MTP layer-index alias)
+  and generates them from the image at launch. sparkrun recipes cannot add
+  volumes; baking them would mean a new image per kit update. Precedent: the
+  MiaAI DeepSeek compose lane ran the same way.
+- **Serves `qwen3.8-flash-next` on :8000, native 262144 ctx** — LiteLLM, opencode
+  and Zed entries are unchanged (context limits already say 262144).
+- **Local `.env` deviations from the kit** (each explained in the file): gmu
+  `0.80` not `0.835`, `MAX_NUM_SEQS=6` not 8, **`KV_CACHE_DTYPE=auto` (bf16)**
+  not the kit's new `fp8` default (a quality trade on sparse attention we do not
+  need at 262K x 6), YaRN off, RadixArk checkpoint (the kit now defaults to
+  `nvidia/…`, which is not on either node). `VLLM_ALLOW_LONG_MAX_MODEL_LEN` must be
+  *defined* (empty) — `start.sh` dereferences it under `set -u`.
+- **`REQUIRE_IDLE_GPU=true`**: the launch refuses while another engine (the
+  DeepSeek lane) holds a GPU. `make stop` first.
+- **Boot ~11 min cold**; the first request after boot is slow (FlashInfer autotune).
+  Head log receipts to look for: `Available KV cache memory` (~28 GiB / ~1.8M
+  tokens at gmu 0.80 bf16), the MTP acceptance curve decaying ~89/74/60% by
+  position (a wrong block shape shows as near-random acceptance), and only the
+  two documented `MXFP8 layer … falling back` shapes.
+- **Thinking is ON server-side** (vLLM `--reasoning-parser qwen3`,
+  `--tool-call-parser qwen3_coder`); the LiteLLM `-think` / `-nothink` variants
+  pass `enable_thinking` per request as before. This is a reasoning model: an
+  empty `content` with `finish_reason: length` means raise `max_tokens`.
+- **Vision:** text + image + video in, `mm-encoder-tp-mode data` (the `weights`
+  mode crashes at load). The MTP drafter cannot see image embeddings, so image
+  requests draft from text only (lower acceptance, still correct).
+- **Stop with `make stop-qwen38fn`** (`./stop.sh`, both nodes); `make logs` cannot
+  see it — use `make logs-qwen38fn`.
+
+## 2026-09-06 evaluations — checked, not adopted
+
+- **tonyd2wild/DeepSeek-V4-Flash-Vision-SGLang-DGX-Spark** (SGLang preview
+  `lmsysorg/sglang:dev-v4f-2dgx-v2`, same Vision-Exp checkpoint): their own
+  status is "staging checkpoint … untuned … numbers are a baseline, not a
+  verdict", and the like-for-like vLLM TP2 comparison "is still owed". It serves
+  327K ctx (ours 1M), leaves ~9 GB KV per node (~0.5M tokens vs our ~2.8M), needs
+  a 48 GB swapfile per node to survive weight loading, pays 10-15 min of cold JIT,
+  and measured 45 tok/s C1 median / 31 prose / 60 code on real prompts with a
+  DSpark accept length of ~2.2 (cookbook quotes 3.2). Nothing here beats the
+  vLLM DSpark lane we run; re-check when they publish the TP2 head-to-head.
+- **tonyd2wild/GLM-5.3-Flash-EXL3-on-2x-NVIDIA-DGX-Spark** (Reederey87 kit,
+  `brandonmusic/GLM-5.3-Flash-tr3-4bpw`, exllamav3 built from source for sm_121a,
+  DFlash2 k=7): the "EXL3 wins every metric" headline was **retracted** — the
+  NVFP4 nodes had been clock-capped at 611-728 MHz. Same-state re-test: quality
+  tie (40 prompts, 3 runs; 12/12 vs 12/12 on the battery), NVFP4 faster on fresh
+  work (TTFT 1.29 s vs 2.31 s at c1, fresh prefill 1225 vs 684 tok/s, cold 211K
+  prefill 2763 vs 1752 tok/s, code decode 52 vs 49), EXL3 wins prefix-cache
+  replay (211K replayed 0.8 s vs 9.2 s), mixed c4 load (43 vs 31 tok/s) and
+  headroom (1M ctx, 1.4M-token pool vs our 256K / 679K). For a single-user agent
+  lane that mostly sends fresh long prompts, that is a lateral move costing
+  ~164 GiB more weights on each node, a from-source image build and a launch kit
+  outside sparkrun. Not adopted; the trade to revisit is 1M ctx on GLM. (Their
+  NVFP4 comparison lane is the same tonyd2wild recipe we run, at the older 3 GiB
+  KV pin.)
+
 ## inkling-small-nvfp4 (v2, SGLang + DSpark) — caveats
 
 Rewritten 2026-08-06 to MiaAI's dual-Spark wrapper around drowzeys' champion
