@@ -3,6 +3,7 @@
 #
 # make deepseek                         # launch DeepSeek-V4-Flash-Vision-Exp (native vision) + DSpark, NVFP4 KV, 1M ctx (local)
 # make glm                              # launch GLM-5.3-Flash NVFP4 + DFlash2 k=7 spec decode (320B/18B-A multimodal MoE)
+# make glm-exl3                         # launch GLM-5.3-Flash EXL3 4bpw + DFlash2 k=7, 1M ctx (Reederey87 kit, NOT sparkrun) — A/B lane vs `make glm`
 # make qwen38fn                         # launch Qwen3.8-Flash-Next NVFP4, MiaAI vLLM TP2+EP+MTP3 kit, 262K ctx (2-node, NOT sparkrun)
 # make deepseek MAX_MODEL_LEN=500000    # override context length
 # make deepseek-dry                     # VRAM/fit estimate, no launch
@@ -68,6 +69,42 @@ DEEPSEEK_RECIPE       := recipes/deepseek-v4-flash-vision-exp.yaml
 #  image glm53-flash-sm121:v8 with LibertAIDAI weights. recipes/glm-5.3-flash-nvfp4.yaml
 #  and that image are both kept for rollback — point GLM_RECIPE back at the yaml.)
 GLM_RECIPE            := recipes/glm-5.3-flash-dflash2.yaml
+# GLM-5.3-Flash EXL3/TR3 4bpw (brandonmusic quant, exllamav3 kernels built for
+# sm_121a) + the same DFlash2 k=7 drafter — Reederey87's GB10-hardened fork of
+# MiaAI's EXL3 kit, added 2026-09-07 as a SEPARATE lane to A/B against `make glm`,
+# not as a replacement (github.com/Reederey87/glm53-flash-exl3-2x-dgx-spark @
+# 7d80e87; clone + this pair's .env at ~/src/glm53-exl3; every local value is
+# marked LEO: in the .env). NOT a sparkrun recipe: like the Qwen kit it runs its
+# own launcher (docker per node over SSH on the CX7 link). Why this fork and not
+# MiaAI's original: fine-grained prefix-cache hits at 64-token grain (follow-up
+# turns reuse 96-99% of the prompt, ~4 s -> ~1 s per turn), per-group KV
+# retention (multi-session hits 0% -> 100%), a long-prefill fairness cap (short
+# request behind a 240K read: 256 s -> ~7 s), memory-gated restarts and a JIT
+# cache shape guard. MiaAI's README says its hits land only on 3584-token pages.
+# What the A/B is for (tonyd2wild, same-clock, 2026-09-01): quality tie with the
+# NVFP4 lane; NVFP4 faster on fresh prompts/prefill, EXL3 4x faster TTFT in
+# multi-turn agent loops and 1M ctx (1.40M-token pool). Kit facts: image
+# glm53-selfbuild is BUILT on the head from the kit Dockerfile (base
+# vllm/vllm-openai:glm53-flash-arm64-cu130 @ sha256:905c0293 — already local;
+# exllamav3 + fat-GEMM kernels compile in-image, ~40 min, needs the GPU idle for
+# RAM), then shipped to the worker by start.sh. Weights brandonmusic/
+# GLM-5.3-Flash-tr3-4bpw @ 1ae6d70 (~164 GiB on BOTH nodes; start.sh rsyncs the
+# worker copy over CX7). Serving shape is the kit's PROD set: 1M ctx, MNBT 3584
+# (= the hybrid page size; APC reads 0% otherwise), 4 seqs, KV pinned to
+# 15414698763 bytes (NEVER raise), --no-async-scheduling, gmu 0.85 as boot gate,
+# fp8_ds_mla KV, thinking on, vision on, served name glm-5.3-flash-exl3 on :8000.
+# Local deviations: SERVED_MODEL_NAME/PORT, WORKER_SSH=leo@10.100.200.1, the
+# cross-wired CX7 pins (head f0 / worker f1), HF_BIN="uvx hf" (no hf CLI here),
+# HF_HUB_DISABLE_XET=1, GLM53_DEFAULT_REASONING_EFFORT empty (= template Max,
+# matching `make glm`), and start.sh's --host 127.0.0.1 -> 0.0.0.0 (the kit
+# binds loopback on purpose; LiteLLM lives on rtx-5090). prod-start.sh needs
+# MemFree >= 90 GiB on both nodes, so `flush` runs first and the other lanes
+# must be down (one model at a time). Gotchas from tonyd2wild's bring-up: the
+# worker needs the FULL 164 GiB copy; ~/.cache/vllm-glm53-flash must be owned
+# by leo on both nodes; first boot after any shape change is a long cold JIT
+# (READY_TIMEOUT 4800). Status 2026-09-07: kit cloned, .env written, weights
+# downloading — image build + first boot + A/B pending.
+GLM_EXL3_DIR          := $(HOME)/src/glm53-exl3
 # Qwen3.8-Flash-Next NVFP4 (125B-A3B hybrid MoE + 51B PLE + MTP head,
 # multimodal) — MiaAI-Lab's vLLM TP2+EP+MTP3 kit, adopted 2026-09-06 @ c2325b2
 # (github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Dual-DGX-Sparks; clone + this pair's
@@ -131,10 +168,10 @@ RUN := $(SPARKRUN) run --cluster $(CLUSTER)
 # The worker node (node_1), addressed over the cluster link the way sparkrun does.
 WORKER ?= 10.100.200.1
 
-.PHONY: help deepseek glm qwen38fn qwen38fn-sglang \
-        deepseek-dry glm-dry qwen38fn-dry \
-        stop stop-deepseek stop-glm stop-qwen38fn stop-qwen38fn-sglang \
-        status logs logs-qwen38fn list flush patch-sparkrun
+.PHONY: help deepseek glm glm-exl3 glm-exl3-build qwen38fn qwen38fn-sglang \
+        deepseek-dry glm-dry glm-exl3-dry qwen38fn-dry \
+        stop stop-deepseek stop-glm stop-glm-exl3 stop-qwen38fn stop-qwen38fn-sglang \
+        status logs logs-glm-exl3 logs-qwen38fn list flush patch-sparkrun
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z0-9_-]+:.*?## ' $(MAKEFILE_LIST) | \
@@ -178,6 +215,12 @@ deepseek: ## Launch DeepSeek-V4-Flash-Vision-Exp + DSpark k=5 (tonyd2wild vision
 glm: flush patch-sparkrun ## Launch GLM-5.3-Flash NVFP4 + DFlash2 k=7 spec decode (local, 2-node, 256K ctx)
 	$(RUN) $(GLM_RECIPE) $(OVERRIDES)
 
+glm-exl3: flush ## Launch GLM-5.3-Flash EXL3 4bpw + DFlash2 k=7 (Reederey87 kit, 2-node, 1M ctx) — A/B lane
+	cd $(GLM_EXL3_DIR) && set -a && . ./.env && set +a && local/prod-start.sh
+
+glm-exl3-build: ## Build the EXL3 serving image glm53-selfbuild on the head (~40 min, GPU must be idle: RAM)
+	cd $(GLM_EXL3_DIR) && docker build -t glm53-selfbuild . 2>&1 | tee ~/bench/glm53-exl3-build-$$(date +%Y%m%d-%H%M).log | tail -5
+
 qwen38fn: flush ## Launch Qwen3.8-Flash-Next NVFP4 (MiaAI vLLM TP2+EP+MTP3 kit, 2-node, 262K ctx, bf16 KV)
 	cd $(QWEN38FN_DIR) && ./start.sh --launch
 
@@ -192,6 +235,9 @@ deepseek-dry: ## Estimate VRAM/context fit for DeepSeek-V4-Flash-Vision-Exp + DS
 glm-dry: ## Estimate VRAM/context fit for GLM-5.3-Flash NVFP4 + DFlash2
 	$(RUN) $(GLM_RECIPE) $(OVERRIDES) --dry-run
 
+glm-exl3-dry: ## Validate the EXL3 kit config (.env, fabric pins, GID tables) without launching
+	cd $(GLM_EXL3_DIR) && set -a && . ./.env && set +a && ./start.sh validate
+
 qwen38fn-dry: ## Preflight the MiaAI Qwen3.8 kit: .env, worker SSH, weights on both nodes (no launch)
 	cd $(QWEN38FN_DIR) && ./start.sh --no-download --no-launch && ./check-weights.sh
 
@@ -205,15 +251,19 @@ flush: ## Drop the page cache on both nodes (GB10 UMA: NVRM needs physically fre
 	ssh -o BatchMode=yes -o ConnectTimeout=10 $(WORKER) 'sync; echo 3 | sudo -n tee /proc/sys/vm/drop_caches >/dev/null'
 	@echo "MemAvailable after flush:"; grep MemAvailable /proc/meminfo; ssh -o BatchMode=yes $(WORKER) grep MemAvailable /proc/meminfo
 
-stop: ## Stop all workloads on the cluster (sparkrun lanes + the MiaAI vllm-fn lane)
+stop: ## Stop all workloads on the cluster (sparkrun lanes + the Qwen and GLM-EXL3 kits)
 	$(SPARKRUN) stop --all --cluster $(CLUSTER)
 	-cd $(QWEN38FN_DIR) && ./stop.sh
+	-cd $(GLM_EXL3_DIR) && set -a && . ./.env && set +a && ./start.sh stop
 
 stop-deepseek: ## Stop just the DeepSeek-V4-Flash-Vision-Exp + DSpark workload
 	$(SPARKRUN) stop $(DEEPSEEK_RECIPE) --cluster $(CLUSTER)
 
 stop-glm: ## Stop just the GLM-5.3-Flash NVFP4 + DFlash2 workload
 	$(SPARKRUN) stop $(GLM_RECIPE) --cluster $(CLUSTER)
+
+stop-glm-exl3: ## Stop just the GLM-5.3-Flash EXL3 workload (glm53-exl3-head/-worker)
+	cd $(GLM_EXL3_DIR) && set -a && . ./.env && set +a && ./start.sh stop
 
 stop-qwen38fn: ## Stop just the Qwen3.8-Flash-Next workload (MiaAI kit: vllm-fn on both nodes)
 	cd $(QWEN38FN_DIR) && ./stop.sh
@@ -225,6 +275,8 @@ status: ## Show running sparkrun containers (+ the MiaAI vllm-fn containers, if 
 	$(SPARKRUN) status --cluster $(CLUSTER)
 	@docker ps --filter name=vllm-fn --format 'vllm-fn (head):   {{.Status}}  {{.Image}}' 2>/dev/null || true
 	@ssh -o BatchMode=yes -o ConnectTimeout=5 $(WORKER) "docker ps --filter name=vllm-fn --format 'vllm-fn (worker): {{.Status}}  {{.Image}}'" 2>/dev/null || true
+	@docker ps --filter name=glm53-exl3 --format 'glm53-exl3 (head):   {{.Status}}  {{.Image}}' 2>/dev/null || true
+	@ssh -o BatchMode=yes -o ConnectTimeout=5 $(WORKER) "docker ps --filter name=glm53-exl3 --format 'glm53-exl3 (worker): {{.Status}}  {{.Image}}'" 2>/dev/null || true
 
 logs: ## Tail the running workload's logs (or a specific one: make logs TARGET=<job-id|recipe>)
 	@target="$(TARGET)"; \
@@ -238,6 +290,9 @@ logs: ## Tail the running workload's logs (or a specific one: make logs TARGET=<
 	fi; \
 	echo "sparkrun logs $$target"; \
 	$(SPARKRUN) logs $$target
+
+logs-glm-exl3: ## Tail the GLM EXL3 head container (kit launcher; `make logs` cannot see it)
+	cd $(GLM_EXL3_DIR) && set -a && . ./.env && set +a && ./start.sh logs
 
 logs-qwen38fn: ## Tail the MiaAI Qwen3.8 head container (the kit is not a sparkrun job, so `make logs` cannot see it)
 	docker logs -f vllm-fn
