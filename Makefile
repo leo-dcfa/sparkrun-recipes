@@ -4,7 +4,9 @@
 # make deepseek                         # launch DeepSeek-V4-Flash-Vision-Exp (native vision) + DSpark, NVFP4 KV, 1M ctx (local)
 # make glm                              # launch GLM-5.3-Flash NVFP4 + DFlash2 k=7 spec decode (320B/18B-A multimodal MoE)
 # make glm-exl3                         # launch GLM-5.3-Flash EXL3 4bpw + DFlash2 k=7, 1M ctx (Reederey87 kit, NOT sparkrun) — A/B lane vs `make glm`
-# make qwen38fn                         # launch Qwen3.8-Flash-Next NVFP4, MiaAI vLLM TP2+EP+MTP3 kit, 262K ctx (2-node, NOT sparkrun)
+# make qwen38fn                         # PARKED 2026-09-08 (commented out below; MiaAI vLLM TP2+EP+MTP3 kit) — superseded by `make qwen-flash`
+# make qwen-flash                       # launch Qwen3.8-Flash-Next NVFP4 (nvidia ckpt), tonyd2wild vLLM TP2 SPEED lane, 262K ctx, thinking ON (2-node, NOT sparkrun)
+# make qwen-flash-no-thinking           # same lane, enable_thinking false server-side
 # make deepseek MAX_MODEL_LEN=500000    # override context length
 # make deepseek-dry                     # VRAM/fit estimate, no launch
 # make stop                             # stop everything on the cluster
@@ -105,6 +107,10 @@ GLM_RECIPE            := recipes/glm-5.3-flash-dflash2.yaml
 # (READY_TIMEOUT 4800). Status 2026-09-07: kit cloned, .env written, weights
 # downloading — image build + first boot + A/B pending.
 GLM_EXL3_DIR          := $(HOME)/src/glm53-exl3
+# PARKED 2026-09-08 — superseded by `make qwen-flash` (tonyd2wild lane, below),
+# which was verified on this pair the same day. The launch/dry/logs targets are
+# commented out, not deleted: uncomment them (and `make qwen-flash` off) to roll
+# back. The kit, its .env and the RadixArk checkpoint stay on disk.
 # Qwen3.8-Flash-Next NVFP4 (125B-A3B hybrid MoE + 51B PLE + MTP head,
 # multimodal) — MiaAI-Lab's vLLM TP2+EP+MTP3 kit, adopted 2026-09-06 @ c2325b2
 # (github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Dual-DGX-Sparks; clone + this pair's
@@ -148,6 +154,74 @@ GLM_EXL3_DIR          := $(HOME)/src/glm53-exl3
 # Upstream drops page cache on both nodes before launch (GB10 UMA) — `flush`.
 QWEN38FN_DIR           := $(HOME)/src/qwen38-flashnext-miaai-vllm
 QWEN38FN_SGLANG_RECIPE := recipes/qwen3.8-flash-next-sglang.yaml
+# Qwen3.8-Flash-Next NVFP4 — tonyd2wild's vLLM TP2 "SPEED" lane, added 2026-09-08
+# as `make qwen-flash` (github.com/tonyd2wild/Qwen3.8-Flash-Next-NVFP4-DGX-Spark
+# @ 6ad1c8f; clone at ~/src/qwen38-flashnext-tony — the same clone the parked
+# SGLang lane came from, pulled forward from b515104; that SGLang lane now lives
+# under lanes/sglang-tp2/ upstream, unchanged). Upstream rebuilt the repo on vLLM
+# 2026-09-05: nightly vllm/vllm-openai:nightly-8a728663 (vLLM main 2026-09-04)
+# + five bind-mounted overlays (PR #55375 PLE conv-state stride fix, PR #54846
+# x3 fp8 KV on the QSA path, their modelopt.py MTP-loading fixes; provenance +
+# sha256 in the patch dir's PROVENANCE.md) on the OFFICIAL
+# nvidia/Qwen3.8-Flash-Next-NVFP4 checkpoint — NOT the RadixArk build the MiaAI
+# kit uses (different config, 23 KB vs 504-byte hf_quant_config, 10 shards vs
+# 419 per-layer expert files). 133 GB at
+# /var/tmp/models/Qwen3.8-Flash-Next-NVFP4-nvidia on BOTH nodes (head pulled it
+# over Wi-Fi with `uvx hf download`, worker rsynced over CX7).
+# config.json in that dir is PINNED to HF revision fab0aecb (2026-09-03, the
+# snapshot tonyd2wild, sfxnz and MiaAI all validated). NVIDIA's fc694b54
+# (2026-09-05 23:36 UTC, "Fix MTP serving metadata and instructions") changed
+# exactly one line, the MTP experts' quant_algo FP8_BLOCK_SCALES -> FP8_PB_WO
+# (weights and hf_quant_config.json are byte-identical between the two), and
+# this nightly's mixed-precision MoE dispatch + tonyd2wild's overlay do not
+# route FP8_PB_WO: the draft head loads unquantized and boot dies at shard
+# 11/11 with "mtp.layers.48.mlp.experts has no parameter 'w2_weight_scale_inv'"
+# (first boot here, 2026-09-08 16:16, both ranks). NVIDIA's copy is kept next
+# to it as config.json.fc694b54; a fresh `hf download` would undo the pin, and
+# `qwen-flash-dry` / CHECK=1 fail loudly on FP8_PB_WO. Worth an upstream note
+# to tonyd2wild (one-token overlay change: accept FP8_PB_WO in the MoE branch).
+# SPEED profile = n-gram table in unified memory (stock loader), decode CUDA
+# graphs with torch.compile OFF ({"mode":0,"cudagraph_mode":"FULL_DECODE_ONLY"}
+# — Inductor duplicates the 47.7 GB table during compile and rebooted their
+# Sparks), MTP3, 6 seqs, --max-num-batched-tokens 4096 (their biggest single
+# lever, +50% under compile-off; NEVER pair it with compile on: 8-15 tok/s),
+# fp8_e4m3 KV, gmu 0.70, native 262K, prefix caching off, FlashInfer autotune
+# off, VLLM_USE_DEEP_GEMM=0. Upstream measured on 2x GB10: 53.7 tok/s median
+# single stream over 40 real prompts, 97.9 aggregate at x6, 180 ms TTFT, KV
+# pool 1.97M tokens (7 x 262K), ~2.8K tok/s prefill at 28K. PROFILE=context
+# gives their CONTEXT profile (table on disk via their patch, compile on, MTP4,
+# 8 seqs, gmu 0.80): 5.87M-token pool at 35.8 tok/s.
+# NOT a sparkrun recipe (same reason as the MiaAI kit: bind-mounted overlays).
+# The launcher is upstream's launch/qwen38fn-nvidia-tp2.sh with this pair's
+# deviations marked LEO: in tools/qwen-flash-tp2.sh: LANE=leo (10.100.200.2
+# head / .1 worker, cross-wired CX7 = head f0 / worker f1, HCA + socket ifnames
+# derived per rank from the host IP), THINKING knob (upstream ships OFF; the
+# two targets below set it), PROFILE + CHECK conveniences, nothing else.
+# Container vllm_qwen38fn (upstream's name) on both nodes, served name
+# qwen3.8-flash-next on :8000 — LiteLLM/opencode/Zed entries unchanged.
+# Upstream's run order: worker (rank 1) first, then head; the targets do that.
+# One model at a time: `make stop` first (the launcher does not check for a
+# busy GPU).
+QWEN_FLASH_DIR      := $(HOME)/src/qwen38-flashnext-tony
+QWEN_FLASH_LAUNCHER := tools/qwen-flash-tp2.sh
+QWEN_FLASH_PATCHES  := $(HOME)/patches/qwen4exp-ple-mmap
+# Knobs for `make qwen-flash*` (command line): PROFILE=speed|context,
+# KV_DTYPE=fp8_e4m3|auto (auto = bf16, the MiaAI-lane choice; halves the pool),
+# DRAFT_VOCAB=65536 (reduced-vocab MTP draft: prose +10%, short structured -2..3 tok/s), GMU=.
+PROFILE     ?= speed
+KV_DTYPE    ?=
+DRAFT_VOCAB ?=
+GMU         ?=
+QWEN_FLASH_ENV := PROFILE=$(PROFILE)
+ifneq ($(strip $(KV_DTYPE)),)
+QWEN_FLASH_ENV += KV_DTYPE=$(KV_DTYPE)
+endif
+ifneq ($(strip $(DRAFT_VOCAB)),)
+QWEN_FLASH_ENV += DRAFT_VOCAB=$(DRAFT_VOCAB)
+endif
+ifneq ($(strip $(GMU)),)
+QWEN_FLASH_ENV += GMU=$(GMU)
+endif
 
 # Optional overrides — set on the command line, e.g.
 # make deepseek MAX_MODEL_LEN=1000000 GPU_MEM=0.85
@@ -168,10 +242,11 @@ RUN := $(SPARKRUN) run --cluster $(CLUSTER)
 # The worker node (node_1), addressed over the cluster link the way sparkrun does.
 WORKER ?= 10.100.200.1
 
-.PHONY: help deepseek glm glm-exl3 glm-exl3-build qwen38fn qwen38fn-sglang \
-        deepseek-dry glm-dry glm-exl3-dry qwen38fn-dry \
-        stop stop-deepseek stop-glm stop-glm-exl3 stop-qwen38fn stop-qwen38fn-sglang \
-        status logs logs-glm-exl3 logs-qwen38fn list flush patch-sparkrun
+.PHONY: help deepseek glm glm-exl3 glm-exl3-build qwen38fn-sglang qwen-flash qwen-flash-no-thinking qwen-flash-sync \
+        deepseek-dry glm-dry glm-exl3-dry qwen-flash-dry \
+        stop stop-deepseek stop-glm stop-glm-exl3 stop-qwen38fn stop-qwen38fn-sglang stop-qwen-flash \
+        status logs logs-glm-exl3 logs-qwen-flash list flush patch-sparkrun cache-flusher stop-cache-flusher
+# (qwen38fn, qwen38fn-dry, logs-qwen38fn left out on purpose: parked 2026-09-08, see the MiaAI block)
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z0-9_-]+:.*?## ' $(MAKEFILE_LIST) | \
@@ -179,7 +254,7 @@ help: ## Show this help
 
 ## --- launch ---------------------------------------------------------------
 
-deepseek: ## Launch DeepSeek-V4-Flash-Vision-Exp + DSpark k=5 (tonyd2wild vision port, 2-node, NVFP4 KV, 1M ctx)
+deepseek: cache-flusher ## Launch DeepSeek-V4-Flash-Vision-Exp + DSpark k=5 (tonyd2wild vision port, 2-node, NVFP4 KV, 1M ctx)
 	$(RUN) $(DEEPSEEK_RECIPE) $(OVERRIDES)
 
 # `flush` first, since 2026-09-05: NVRM refused part of the 6 GiB KV carve-out at
@@ -212,20 +287,37 @@ deepseek: ## Launch DeepSeek-V4-Flash-Vision-Exp + DSpark k=5 (tonyd2wild vision
 #   docker inspect <node_0> | grep -E "VLLM_HOST_IP|GLOO_SOCKET_IFNAME" -> 10.100.200.2 / enp1s0f0np0
 #   grep mq_connect_ip /tmp/sparkrun_serve.log (in-container)         -> 10.100.200.2, not 192.168.0.120
 # Cabling the 10GbE ports would make the patch redundant (wired default route).
-glm: flush patch-sparkrun ## Launch GLM-5.3-Flash NVFP4 + DFlash2 k=7 spec decode (local, 2-node, 256K ctx)
+glm: flush patch-sparkrun cache-flusher ## Launch GLM-5.3-Flash NVFP4 + DFlash2 k=7 spec decode (local, 2-node, 256K ctx)
 	$(RUN) $(GLM_RECIPE) $(OVERRIDES)
 
-glm-exl3: flush ## Launch GLM-5.3-Flash EXL3 4bpw + DFlash2 k=7 (Reederey87 kit, 2-node, 1M ctx) — A/B lane
+glm-exl3: flush cache-flusher ## Launch GLM-5.3-Flash EXL3 4bpw + DFlash2 k=7 (Reederey87 kit, 2-node, 1M ctx) — A/B lane
 	cd $(GLM_EXL3_DIR) && set -a && . ./.env && set +a && local/prod-start.sh
 
 glm-exl3-build: ## Build the EXL3 serving image glm53-selfbuild on the head (~40 min, GPU must be idle: RAM)
 	cd $(GLM_EXL3_DIR) && docker build -t glm53-selfbuild . 2>&1 | tee ~/bench/glm53-exl3-build-$$(date +%Y%m%d-%H%M).log | tail -5
 
-qwen38fn: flush ## Launch Qwen3.8-Flash-Next NVFP4 (MiaAI vLLM TP2+EP+MTP3 kit, 2-node, 262K ctx, bf16 KV)
-	cd $(QWEN38FN_DIR) && ./start.sh --launch
+# PARKED 2026-09-08 — superseded by `make qwen-flash`; uncomment to roll back to the MiaAI kit.
+#qwen38fn: flush ## Launch Qwen3.8-Flash-Next NVFP4 (MiaAI vLLM TP2+EP+MTP3 kit, 2-node, 262K ctx, bf16 KV)
+#	cd $(QWEN38FN_DIR) && ./start.sh --launch
 
 qwen38fn-sglang: ## PARKED — tonyd2wild SGLang lane (dies on first real prefill); reference only
 	$(RUN) $(QWEN38FN_SGLANG_RECIPE) $(OVERRIDES)
+
+qwen-flash: flush cache-flusher qwen-flash-sync ## Launch Qwen3.8-Flash-Next NVFP4 (nvidia ckpt) — tonyd2wild vLLM TP2 SPEED lane, 262K ctx, fp8 KV, MTP3, thinking ON
+	ssh -o BatchMode=yes -o ConnectTimeout=10 $(WORKER) 'THINKING=1 $(QWEN_FLASH_ENV) bash ~/qwen-flash-tp2.sh 1'
+	THINKING=1 $(QWEN_FLASH_ENV) bash $(QWEN_FLASH_LAUNCHER) 0
+	@echo "booting (~10 min to serve): make logs-qwen-flash — ready at 'Application startup complete'"
+
+qwen-flash-no-thinking: flush cache-flusher qwen-flash-sync ## Same lane with enable_thinking false server-side (clients can still send enable_thinking per request)
+	ssh -o BatchMode=yes -o ConnectTimeout=10 $(WORKER) 'THINKING=0 $(QWEN_FLASH_ENV) bash ~/qwen-flash-tp2.sh 1'
+	THINKING=0 $(QWEN_FLASH_ENV) bash $(QWEN_FLASH_LAUNCHER) 0
+	@echo "booting (~10 min to serve): make logs-qwen-flash — ready at 'Application startup complete'"
+
+qwen-flash-sync: ## Ship upstream's patch dir + the launcher to the worker (idempotent; rerun after a git pull in $(QWEN_FLASH_DIR))
+	mkdir -p $(QWEN_FLASH_PATCHES)
+	rsync -a --delete $(QWEN_FLASH_DIR)/single-spark-vllm-tp1/patch/ $(QWEN_FLASH_PATCHES)/
+	rsync -a --delete $(QWEN_FLASH_PATCHES)/ $(WORKER):patches/qwen4exp-ple-mmap/
+	rsync -a $(QWEN_FLASH_LAUNCHER) $(WORKER):qwen-flash-tp2.sh
 
 ## --- dry-run / VRAM fit estimate (no launch) ------------------------------
 
@@ -238,23 +330,64 @@ glm-dry: ## Estimate VRAM/context fit for GLM-5.3-Flash NVFP4 + DFlash2
 glm-exl3-dry: ## Validate the EXL3 kit config (.env, fabric pins, GID tables) without launching
 	cd $(GLM_EXL3_DIR) && set -a && . ./.env && set +a && ./start.sh validate
 
-qwen38fn-dry: ## Preflight the MiaAI Qwen3.8 kit: .env, worker SSH, weights on both nodes (no launch)
-	cd $(QWEN38FN_DIR) && ./start.sh --no-download --no-launch && ./check-weights.sh
+# PARKED 2026-09-08 with `make qwen38fn` (MiaAI kit); uncomment together.
+#qwen38fn-dry: ## Preflight the MiaAI Qwen3.8 kit: .env, worker SSH, weights on both nodes (no launch)
+#	cd $(QWEN38FN_DIR) && ./start.sh --no-download --no-launch && ./check-weights.sh
+
+qwen-flash-dry: qwen-flash-sync ## Preflight the qwen-flash lane on both nodes: image, nvidia checkpoint, overlay files, RDMA, NICs (no launch)
+	CHECK=1 $(QWEN_FLASH_ENV) bash $(QWEN_FLASH_LAUNCHER) 0
+	ssh -o BatchMode=yes -o ConnectTimeout=10 $(WORKER) 'CHECK=1 $(QWEN_FLASH_ENV) bash ~/qwen-flash-tp2.sh 1'
 
 ## --- lifecycle ------------------------------------------------------------
 
 patch-sparkrun: ## Keep sparkrun's torch/gloo control plane off Wi-Fi (idempotent; re-run after `sparkrun update`)
 	python3 tools/patch_sparkrun_wifi.py
 
-flush: ## Drop the page cache on both nodes (GB10 UMA: NVRM needs physically free memory for the KV slab)
+# `flush` refuses to run when vm.swappiness is not 0 on BOTH nodes (added
+# 2026-09-08). tonyd2wild's GLM README calls swappiness=0 mandatory on these
+# 121 GiB unified-memory nodes and warns it does not survive a reboot: at the
+# default (60) the kernel pages vLLM out mid-load (UVM livelock in their fleet).
+# Here the reboot of 2026-09-07 05:32 silently reset both nodes to 60; every
+# load then pushed 3-6 GB into swap, which opened earlyoom's `-s 80` swap gate,
+# after which any dip under 2% MemAvailable kills vLLM (GLM's head rank was
+# SIGTERM'd that way on 2026-09-08 16:00:35, 4 s before ready, while a
+# checkpoint download ran on the head). Persisted now in
+# /etc/sysctl.d/99-spark-swappiness.conf on both nodes; this guard catches the
+# next time it is not. Fix: sudo sysctl vm.swappiness=0 on the node named.
+flush: ## Drop the page cache on both nodes (GB10 UMA: NVRM needs physically free memory for the KV slab); refuses if vm.swappiness != 0
+	@h=$$(cat /proc/sys/vm/swappiness); w=$$(ssh -o BatchMode=yes -o ConnectTimeout=10 $(WORKER) cat /proc/sys/vm/swappiness 2>/dev/null || echo unreachable); \
+	if [ "$$h" != "0" ] || [ "$$w" != "0" ]; then \
+	  echo "REFUSING TO LAUNCH: vm.swappiness is $$h on the head and $$w on the worker; both must be 0 (see the comment above flush:)." >&2; \
+	  echo "  fix: sudo sysctl vm.swappiness=0 && echo vm.swappiness=0 | sudo tee /etc/sysctl.d/99-spark-swappiness.conf   (on the node named)" >&2; exit 1; fi
 	sync; echo 3 | sudo -n tee /proc/sys/vm/drop_caches >/dev/null
 	ssh -o BatchMode=yes -o ConnectTimeout=10 $(WORKER) 'sync; echo 3 | sudo -n tee /proc/sys/vm/drop_caches >/dev/null'
 	@echo "MemAvailable after flush:"; grep MemAvailable /proc/meminfo; ssh -o BatchMode=yes $(WORKER) grep MemAvailable /proc/meminfo
 
-stop: ## Stop all workloads on the cluster (sparkrun lanes + the Qwen and GLM-EXL3 kits)
+# tonyd2wild's cache_flusher.sh (GLM repo @ 050081d, NVIDIA KB 5776 remedy),
+# adopted 2026-09-08 as tools/cache_flusher.sh: for 25 min after a launch it
+# drops the page cache on each node whenever Cached passes 40 GiB, so NVRM can
+# carve the KV slab out of physically free memory. `flush` only clears the
+# cache once, before the 10-minute load refills it; upstream runs this
+# alongside every boot. Every launch target depends on it. A second start
+# replaces the first (pidfile); it exits on its own. Logs:
+# ~/bench/cache-flusher-<host>.log on each node.
+cache-flusher: ## Run tonyd2wild's page-cache flusher on both nodes for the next 25 min (flushes whenever Cached > 40 GiB)
+	rsync -a tools/cache_flusher.sh $(WORKER):cache_flusher.sh
+	nohup bash tools/cache_flusher.sh > /dev/null 2>&1 < /dev/null &
+	ssh -o BatchMode=yes -o ConnectTimeout=10 $(WORKER) 'nohup bash ~/cache_flusher.sh > /dev/null 2>&1 < /dev/null &'
+	@echo "cache flusher running on both nodes for 25 min (logs: ~/bench/cache-flusher-<host>.log)"
+
+stop-cache-flusher: ## Stop the page-cache flusher on both nodes (it also exits by itself after 25 min)
+	-[ -f $(HOME)/.cache_flusher.pid ] && kill $$(cat $(HOME)/.cache_flusher.pid) 2>/dev/null; true
+	-ssh -o BatchMode=yes -o ConnectTimeout=10 $(WORKER) '[ -f ~/.cache_flusher.pid ] && kill $$(cat ~/.cache_flusher.pid) 2>/dev/null; true'
+
+stop: ## Stop all workloads on the cluster (sparkrun lanes + the Qwen, qwen-flash and GLM-EXL3 kits)
 	$(SPARKRUN) stop --all --cluster $(CLUSTER)
 	-cd $(QWEN38FN_DIR) && ./stop.sh
 	-cd $(GLM_EXL3_DIR) && set -a && . ./.env && set +a && ./start.sh stop
+	-docker rm -f vllm_qwen38fn 2>/dev/null
+	-ssh -o BatchMode=yes -o ConnectTimeout=10 $(WORKER) docker rm -f vllm_qwen38fn 2>/dev/null
+	-$(MAKE) --no-print-directory stop-cache-flusher
 
 stop-deepseek: ## Stop just the DeepSeek-V4-Flash-Vision-Exp + DSpark workload
 	$(SPARKRUN) stop $(DEEPSEEK_RECIPE) --cluster $(CLUSTER)
@@ -271,12 +404,18 @@ stop-qwen38fn: ## Stop just the Qwen3.8-Flash-Next workload (MiaAI kit: vllm-fn 
 stop-qwen38fn-sglang: ## Stop the parked SGLang Qwen3.8 lane
 	$(SPARKRUN) stop $(QWEN38FN_SGLANG_RECIPE) --cluster $(CLUSTER)
 
-status: ## Show running sparkrun containers (+ the MiaAI vllm-fn containers, if any)
+stop-qwen-flash: ## Stop just the qwen-flash lane (vllm_qwen38fn on both nodes)
+	-docker rm -f vllm_qwen38fn
+	-ssh -o BatchMode=yes -o ConnectTimeout=10 $(WORKER) docker rm -f vllm_qwen38fn
+
+status: ## Show running sparkrun containers (+ the vllm-fn / qwen-flash / glm53-exl3 kit containers, if any)
 	$(SPARKRUN) status --cluster $(CLUSTER)
 	@docker ps --filter name=vllm-fn --format 'vllm-fn (head):   {{.Status}}  {{.Image}}' 2>/dev/null || true
 	@ssh -o BatchMode=yes -o ConnectTimeout=5 $(WORKER) "docker ps --filter name=vllm-fn --format 'vllm-fn (worker): {{.Status}}  {{.Image}}'" 2>/dev/null || true
 	@docker ps --filter name=glm53-exl3 --format 'glm53-exl3 (head):   {{.Status}}  {{.Image}}' 2>/dev/null || true
 	@ssh -o BatchMode=yes -o ConnectTimeout=5 $(WORKER) "docker ps --filter name=glm53-exl3 --format 'glm53-exl3 (worker): {{.Status}}  {{.Image}}'" 2>/dev/null || true
+	@docker ps --filter name=vllm_qwen38fn --format 'qwen-flash (head):   {{.Status}}  {{.Image}}' 2>/dev/null || true
+	@ssh -o BatchMode=yes -o ConnectTimeout=5 $(WORKER) "docker ps --filter name=vllm_qwen38fn --format 'qwen-flash (worker): {{.Status}}  {{.Image}}'" 2>/dev/null || true
 
 logs: ## Tail the running workload's logs (or a specific one: make logs TARGET=<job-id|recipe>)
 	@target="$(TARGET)"; \
@@ -294,8 +433,12 @@ logs: ## Tail the running workload's logs (or a specific one: make logs TARGET=<
 logs-glm-exl3: ## Tail the GLM EXL3 head container (kit launcher; `make logs` cannot see it)
 	cd $(GLM_EXL3_DIR) && set -a && . ./.env && set +a && ./start.sh logs
 
-logs-qwen38fn: ## Tail the MiaAI Qwen3.8 head container (the kit is not a sparkrun job, so `make logs` cannot see it)
-	docker logs -f vllm-fn
+# PARKED 2026-09-08 with `make qwen38fn` (MiaAI kit); the stop targets stay live for cleanup.
+#logs-qwen38fn: ## Tail the MiaAI Qwen3.8 head container (the kit is not a sparkrun job, so `make logs` cannot see it)
+#	docker logs -f vllm-fn
+
+logs-qwen-flash: ## Tail the qwen-flash head container (not a sparkrun job, so `make logs` cannot see it)
+	docker logs -f vllm_qwen38fn
 
 list: ## List available recipes
 	$(SPARKRUN) list

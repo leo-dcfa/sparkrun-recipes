@@ -1,2 +1,7 @@
 # Claude Code local (personal / machine-specific) settings — not shared.
 .claude/settings.local.json
+
+# Timestamped local snapshots of Makefile / README.md taken before edits —
+# git history is the real record; these are scratch and must not be committed.
+*.bak
+*.bak-*

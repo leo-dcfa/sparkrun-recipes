@@ -365,7 +365,28 @@ Launch: `make qwen35` (single node, TP=1); fit-check: `make qwen35-dry`.
   reads). This NVFP4-Fast recipe is the speed end of that curve; the FP8
   official recipes are the quality end.
 
-## qwen3.8-flash-next — MiaAI vLLM kit (`make qwen38fn`) — caveats
+## Memory guards on every launch (2026-09-08)
+
+Two rules from tonyd2wild's GLM README, adopted after a GLM boot was SIGTERM'd by earlyoom
+4 s before ready on 2026-09-08 (the 2026-09-07 reboot had reset `vm.swappiness` to 60, loads
+then filled swap, which opened earlyoom's `-s 80` gate):
+
+- **`make flush` refuses to launch unless `vm.swappiness` is 0 on both nodes.** It is
+  persisted in `/etc/sysctl.d/99-spark-swappiness.conf` on both; if the guard fires, run
+  `sudo sysctl vm.swappiness=0` on the node it names. Swap stays on (at 0 it is the valve
+  upstream says the marlin repack needs), it just stops being used.
+- **`make cache-flusher`** runs upstream's `cache_flusher.sh` (`tools/cache_flusher.sh`) on
+  both nodes for 25 min, dropping the page cache whenever it passes 40 GiB (NVIDIA KB 5776,
+  the phantom-KV-reserve remedy). Every launch target starts it; `make stop` and
+  `make stop-cache-flusher` end it early. Logs: `~/bench/cache-flusher-<host>.log`.
+- Liveness is `/health` (503 on a dead engine), never `/v1/models` (200 from config alone);
+  `~/bench/bench-lane.sh` polls `/health` first since 2026-09-08.
+
+## qwen3.8-flash-next — MiaAI vLLM kit (`make qwen38fn`) — PARKED 2026-09-08
+
+> **Parked 2026-09-08, superseded by `make qwen-flash`** (tonyd2wild's lane, next section,
+> verified on this pair the same day). The Makefile targets are commented out, not
+> deleted; the kit, its `.env` and the RadixArk checkpoint stay on disk for rollback.
 
 Adopted 2026-09-06 from
 [MiaAI-Lab/Qwen3.8-Flash-Next-Dual-DGX-Sparks](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Dual-DGX-Sparks)
@@ -411,6 +432,88 @@ in 21.8 s and count-to-300 at 64.8 tok/s. Log: `~/bench/qwen38fn-miaai-20260906.
   requests draft from text only (lower acceptance, still correct).
 - **Stop with `make stop-qwen38fn`** (`./stop.sh`, both nodes); `make logs` cannot
   see it — use `make logs-qwen38fn`.
+
+## qwen3.8-flash-next — tonyd2wild vLLM TP2 SPEED lane (`make qwen-flash`) — caveats
+
+Added 2026-09-08 from
+[tonyd2wild/Qwen3.8-Flash-Next-NVFP4-DGX-Spark](https://github.com/tonyd2wild/Qwen3.8-Flash-Next-NVFP4-DGX-Spark)
+@ `6ad1c8f`. Their repo was rebuilt on vLLM on 2026-09-05; the SGLang lane this registry
+adopted on 2026-09-03 now lives under `lanes/sglang-tp2/` upstream, unchanged and still
+parked here. Clone at `~/src/qwen38-flashnext-tony`; the launcher is their
+`single-spark-vllm-tp1/launch/qwen38fn-nvidia-tp2.sh` copied to `tools/qwen-flash-tp2.sh`
+with this pair's deviations marked `LEO:`. Two launch targets, same container:
+**`make qwen-flash`** (thinking ON server-side) and **`make qwen-flash-no-thinking`**.
+
+- **Different checkpoint.** This lane runs NVIDIA's own
+  `nvidia/Qwen3.8-Flash-Next-NVFP4` (25 files, 10 shards, 133 GB), not the RadixArk
+  build the MiaAI kit uses (419 per-layer expert shards, a 504-byte
+  `hf_quant_config.json` against NVIDIA's 23 KB one). Their `modelopt.py` overlay
+  exists to load NVIDIA's MTP head. Both nodes hold a full copy at
+  `/var/tmp/models/Qwen3.8-Flash-Next-NVFP4-nvidia` (head pulled it over Wi-Fi with
+  `uvx --from 'huggingface_hub[cli,hf_xet]' hf download`, worker rsynced over the CX7
+  link at 10.100.201.1). RadixArk stays in the HF cache for the MiaAI kit.
+- **`config.json` is pinned to HF revision `fab0aecb`.** NVIDIA's `fc694b54` (2026-09-05,
+  "Fix MTP serving metadata and instructions") changed one line, the MTP experts'
+  `quant_algo` `FP8_BLOCK_SCALES` -> `FP8_PB_WO`; weights and `hf_quant_config.json` are
+  identical. The pinned nightly plus Tony's overlay do not route `FP8_PB_WO`, so the draft
+  head loads unquantized and boot dies with `mtp.layers.48.mlp.experts has no parameter
+  'w2_weight_scale_inv'` (seen here on the first boot). NVIDIA's copy sits next to it as
+  `config.json.fc694b54`; `make qwen-flash-dry` fails loudly if the pin is lost.
+- **Different image.** `vllm/vllm-openai:nightly-8a728663c1c3eeace834a95f5654fa653cc1998c`
+  (vLLM main 2026-09-04, arm64, 22 GB) on both nodes, plus five files bind-mounted from
+  `~/patches/qwen4exp-ple-mmap/upstream-overlays/` (provenance + sha256 in that dir's
+  `PROVENANCE.md`): PR #55375 (PLE conv-state stride), PR #54846 x3 (fp8 KV on the
+  QSA path), their `modelopt.py` MTP fixes. `make qwen-flash-sync` re-ships the patch
+  dir + launcher to the worker after a `git pull` in the clone; `make qwen-flash-dry`
+  preflights image / checkpoint / overlay files / RDMA / NICs on both nodes.
+- **SPEED profile flags** (upstream default, kept): n-gram table resident (stock
+  loader), `--compilation-config '{"mode":0,"cudagraph_mode":"FULL_DECODE_ONLY"}'`
+  (decode graphs, torch.compile OFF: Inductor duplicates the 47.7 GB table during
+  compile), MTP3, 6 seqs, `--max-num-batched-tokens 4096`, **fp8_e4m3 KV**, gmu 0.70,
+  262K native, prefix caching off, FlashInfer autotune off, `VLLM_USE_DEEP_GEMM=0`.
+  Upstream's numbers on 2x GB10: 53.7 tok/s median single stream (40 real prompts),
+  97.9 aggregate at x6, 180 ms TTFT, KV pool 1.97M tokens (7 x 262K). Never pair the
+  4096 chunk with compile on (8-15 tok/s, measured upstream).
+- **Context:** 262,144 tokens per request (native; 1M with YaRN is possible upstream,
+  not measured). The pool is what changes between lanes: SPEED ~1.97M tokens at fp8
+  (about 7 concurrent full-length requests), roughly half that with `KV_DTYPE=auto`
+  (bf16); `PROFILE=context` (table on disk via their patch, compile on, MTP4, 8 seqs,
+  gmu 0.80) gives 5.87M tokens, 22 full contexts, at 35.8 tok/s.
+- **Knobs on the make line:** `KV_DTYPE=auto` (bf16 KV, the MiaAI-lane choice),
+  `PROFILE=context`, `DRAFT_VOCAB=65536` (reduced-vocabulary MTP draft: prose +10%,
+  short structured answers -2..3 tok/s, not their TP2 default), `GMU=`.
+- **Network:** `LANE=leo` in the launcher pins head `10.100.200.2` / worker
+  `10.100.200.1`, master port 29531, and derives `NCCL_IB_HCA` + the socket ifnames
+  per rank from the host IP (cross-wired CX7: head `enp1s0f0np0`/`rocep1s0f0`, worker
+  `enp1s0f1np1`/`rocep1s0f1`), `NCCL_IB_ADDR_RANGE=10.100.200.0/24`, GID 3. Same
+  RoCE block as upstream otherwise.
+- **Serves `qwen3.8-flash-next` on :8000** (container `vllm_qwen38fn`, upstream's
+  name, on both nodes), `--reasoning-parser qwen3`, `--tool-call-parser qwen3_xml`
+  (upstream's choice; the MiaAI lane uses `qwen3_coder`). LiteLLM/opencode/Zed entries
+  unchanged; the `-think` / `-nothink` variants still pass `enable_thinking` per request.
+- **Boot ~10 min** (weights ~5.5 min + draft head ~1 min + graphs). Run order is
+  worker first, then head (the targets do this). Watch with `make logs-qwen-flash`;
+  ready at `Application startup complete`. Stop with `make stop-qwen-flash` (`make stop`
+  covers it too). One model at a time: `make stop` first.
+- **Verified on this pair 2026-09-08** (second boot, after the `config.json` pin; the first
+  boot died on the draft head as described above). Boot 11 min (weights 438 s, draft head
+  ~1 min, decode graphs 6 s, engine init 90 s). Receipts: `GPU KV cache size: 2,115,687
+  tokens, Maximum concurrency for 262,144 tokens per request: 8.07x` (upstream 1.97M / 7x),
+  63.2 GiB weights per node, MemAvailable ~26 GB on both nodes while serving. Direct to
+  `:8000`, greedy, thinking off unless stated (`~/bench/qwen-flash-20260908.smoke.log`):
+  thinking-on answer with `reasoning_content` (17x23 -> 391), thinking-off same prompt no
+  reasoning, `get_weather` tool call parsed with thinking ON (`finish_reason: tool_calls`,
+  no `!!!!` loop) and OFF, red-square image -> "Red", **53,853-token needle answered
+  correctly, TTFT 21.8 s = 2,467 tok/s prefill**, 350-word prose 39.0 tok/s at 0.28 s TTFT,
+  code 59.1 tok/s, count-to-300 66.6 tok/s (the MiaAI lane's same probe: 64.8), four
+  concurrent prose streams 27-28 tok/s each / 99 tok/s aggregate at 0.91 s TTFT. Upstream's
+  own numbers for this profile: prose 37.2, coding 56.0, x4 aggregate 68.1. llama-benchy
+  matrix (pp 2048 / tg 128 / depth 0 + 32K / c 1,2,6, thinking off,
+  `~/bench/qwen-flash-20260908.json`), same harness as the GLM and DeepSeek rows in
+  `~/bench/`: c1 pp 1,930 tok/s / tg 32.4 / TTFT 1.06 s; c2 tg 48.5 aggregate; c6 tg 77.6
+  aggregate at 3.3 s TTFT; at 32K depth c1 pp 2,731 / tg 36.7 / TTFT 12.7 s, c6 tg 11.1
+  aggregate (prefill-bound, 45 s TTFT). For scale, `make glm` on 2026-09-03 measured c1
+  pp 1,311 / tg 20.2 and c6 tg 37.4 on the same matrix.
 
 ## 2026-09-06 evaluations — checked, not adopted
 
