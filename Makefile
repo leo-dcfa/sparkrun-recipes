@@ -1,9 +1,10 @@
 # Makefile — convenience wrappers around `sparkrun run` for the recipes Leo runs
 # day-to-day on the 2x DGX Spark (GB10) homelab.
 #
-# make deepseek                         # launch DeepSeek-V4-Flash-Vision-Exp (native vision) + DSpark, NVFP4 KV, 1M ctx (local)
+# make deepseek                         # launch DeepSeek-V4-Flash-Vision-Exp + DSpark MTP=6, NVFP4 KV, 1M ctx (MiaAI-Lab kit, NOT sparkrun)
+# make deepseek-sparkrun                # ROLLBACK lane: the tonyd2wild sparkrun recipe this replaced (k=5, 12 seqs)
 # make glm                              # launch GLM-5.3-Flash NVFP4 + DFlash2 k=7 spec decode (320B/18B-A multimodal MoE)
-# make glm-exl3                         # launch GLM-5.3-Flash EXL3 4bpw + DFlash2 k=7, 1M ctx (Reederey87 kit, NOT sparkrun) — A/B lane vs `make glm`
+# make glm-exl3                         # launch GLM-5.3-Flash EXL3 4bpw + DFlash2 k=7, 850K ctx (MiaAI-Lab kit, NOT sparkrun) — A/B lane vs `make glm`
 # make qwen38fn                         # PARKED 2026-09-08 (commented out below; MiaAI vLLM TP2+EP+MTP3 kit) — superseded by `make qwen-flash`
 # make qwen-flash                       # launch Qwen3.8-Flash-Next NVFP4 (nvidia ckpt), tonyd2wild vLLM TP2 SPEED lane, 262K ctx, thinking ON (2-node, NOT sparkrun)
 # make qwen-flash-no-thinking           # same lane, enable_thinking false server-side
@@ -54,6 +55,43 @@ export PATH := $(HOME)/.local/bin:$(PATH)
 #  recipes/deepseek-v4-flash-0731.yaml. It is the faster lane for text-only
 #  work: ~64 tok/s battery mean vs the vision lane's upstream ~55/33.)
 DEEPSEEK_RECIPE       := recipes/deepseek-v4-flash-vision-exp.yaml
+# SWITCHED 2026-09-12 at Leo's request: `make deepseek` is now MiaAI-Lab's DSpark
+# kit (github.com/MiaAI-Lab/DeepSeek-v4-Flash-DSpark-2x-DGX-Spark @ f3d7645,
+# clone + this pair's .env.dspark at ~/src/miaai-ds4-dspark). The tonyd2wild
+# sparkrun recipe it replaced is kept as `make deepseek-sparkrun` — it is NOT
+# retired, just demoted, and DEEPSEEK_RECIPE above still drives it.
+#
+# Why the switch is more than a re-skin: the kit carries ~25 boot-time hotfixes
+# the recipe does not (issue 22 nvfp4_ds_mla long-context decode, issue 27
+# partial-prefill concurrency, issue 55 tool truncation, issue 117 shm ring
+# buffer, issue 43 decode fairness, issue 26 hybrid SWA min, issue 133 triton
+# specialization, the MTP buffer / skip-topk / dense-prefill-indexer /
+# flashmla-workspace / grammar-advance set, plus GB10 spin-wait). It also pins
+# the runtime by DIGEST (anemll 0.1.1 @ sha256:a8394849) rather than tracking a
+# locally built image.
+#
+# Serving-shape deltas vs the sparkrun lane: MTP k=6 (not DSpark k=5),
+# MAX_NUM_SEQS 6 (not 12), gmu 0.835 (not 0.85), --long-prefill-token-threshold
+# 1024, --moe-backend flashinfer_b12x, DEFAULT_THINKING=low (the recipe served
+# thinking:false). Same checkpoint (deepseek-ai/DeepSeek-V4-Flash-Vision-Exp,
+# already cached — nothing re-downloads), same 1M ctx, same nvfp4_ds_mla KV,
+# same served name deepseek-v4-flash-vision-exp and port 8000, so the LiteLLM
+# entry and both Mac client lists are unchanged.
+#
+# LOCAL DEVIATIONS in .env.dspark, all upstream-supported optional overrides:
+# WORKER_NCCL_IB_HCA / WORKER_{NCCL,TP,GLOO}_SOCKET_IFNAME pin the worker to its
+# f1 port (this pair is CROSS-WIRED head f0 / worker f1; upstream's single
+# TP_SOCKET_IFNAME assumes both nodes match, which would strand the worker).
+# start-deepseek-v4-flash-dspark.sh:581-584 is where they are read.
+#
+# 2026-09-12: pulled c444d70 -> f3d7645 and adopted the 16 keys upstream added
+# since this .env was written, at upstream defaults. All ship 0 except
+# DSPARK_ASYNC_SCHEDULING=1, so that adoption changed no behaviour; the block is
+# marked LEO 2026-09-12 in .env.dspark and lists what each knob does. Several
+# (ROPE_SWA_FIX, DSML_RECOVERY, C128A_PREFILL_CACHE, DSPARK_BLOCK_K, SWA_PREFIX,
+# MXFP4_INDEXER_CACHE) are experimental opt-ins — turn on ONE at a time with a
+# measurement, never as a batch.
+DEEPSEEK_MIAAI_DIR    := $(HOME)/src/miaai-ds4-dspark
 # GLM-5.3-Flash NVFP4 + DFlash2 speculative decoding (320B total / 18B active,
 # natively multimodal MoE). tonyd2wild's lane, adopted 2026-08-30, re-synced
 # 2026-09-03 (KV pin 3 -> 6 GiB: 0 preemptions under load vs 6, pool 310K ->
@@ -71,42 +109,98 @@ DEEPSEEK_RECIPE       := recipes/deepseek-v4-flash-vision-exp.yaml
 #  image glm53-flash-sm121:v8 with LibertAIDAI weights. recipes/glm-5.3-flash-nvfp4.yaml
 #  and that image are both kept for rollback — point GLM_RECIPE back at the yaml.)
 GLM_RECIPE            := recipes/glm-5.3-flash-dflash2.yaml
-# GLM-5.3-Flash EXL3/TR3 4bpw (brandonmusic quant, exllamav3 kernels built for
-# sm_121a) + the same DFlash2 k=7 drafter — Reederey87's GB10-hardened fork of
-# MiaAI's EXL3 kit, added 2026-09-07 as a SEPARATE lane to A/B against `make glm`,
-# not as a replacement (github.com/Reederey87/glm53-flash-exl3-2x-dgx-spark @
-# 7d80e87; clone + this pair's .env at ~/src/glm53-exl3; every local value is
-# marked LEO: in the .env). NOT a sparkrun recipe: like the Qwen kit it runs its
-# own launcher (docker per node over SSH on the CX7 link). Why this fork and not
-# MiaAI's original: fine-grained prefix-cache hits at 64-token grain (follow-up
-# turns reuse 96-99% of the prompt, ~4 s -> ~1 s per turn), per-group KV
-# retention (multi-session hits 0% -> 100%), a long-prefill fairness cap (short
-# request behind a 240K read: 256 s -> ~7 s), memory-gated restarts and a JIT
-# cache shape guard. MiaAI's README says its hits land only on 3584-token pages.
-# What the A/B is for (tonyd2wild, same-clock, 2026-09-01): quality tie with the
-# NVFP4 lane; NVFP4 faster on fresh prompts/prefill, EXL3 4x faster TTFT in
-# multi-turn agent loops and 1M ctx (1.40M-token pool). Kit facts: image
-# glm53-selfbuild is BUILT on the head from the kit Dockerfile (base
-# vllm/vllm-openai:glm53-flash-arm64-cu130 @ sha256:905c0293 — already local;
-# exllamav3 + fat-GEMM kernels compile in-image, ~40 min, needs the GPU idle for
-# RAM), then shipped to the worker by start.sh. Weights brandonmusic/
-# GLM-5.3-Flash-tr3-4bpw @ 1ae6d70 (~164 GiB on BOTH nodes; start.sh rsyncs the
-# worker copy over CX7). Serving shape is the kit's PROD set: 1M ctx, MNBT 3584
-# (= the hybrid page size; APC reads 0% otherwise), 4 seqs, KV pinned to
-# 15414698763 bytes (NEVER raise), --no-async-scheduling, gmu 0.85 as boot gate,
-# fp8_ds_mla KV, thinking on, vision on, served name glm-5.3-flash-exl3 on :8000.
-# Local deviations: SERVED_MODEL_NAME/PORT, WORKER_SSH=leo@10.100.200.1, the
-# cross-wired CX7 pins (head f0 / worker f1), HF_BIN="uvx hf" (no hf CLI here),
-# HF_HUB_DISABLE_XET=1, GLM53_DEFAULT_REASONING_EFFORT empty (= template Max,
-# matching `make glm`), and start.sh's --host 127.0.0.1 -> 0.0.0.0 (the kit
-# binds loopback on purpose; LiteLLM lives on rtx-5090). prod-start.sh needs
-# MemFree >= 90 GiB on both nodes, so `flush` runs first and the other lanes
-# must be down (one model at a time). Gotchas from tonyd2wild's bring-up: the
-# worker needs the FULL 164 GiB copy; ~/.cache/vllm-glm53-flash must be owned
-# by leo on both nodes; first boot after any shape change is a long cold JIT
-# (READY_TIMEOUT 4800). Status 2026-09-07: kit cloned, .env written, weights
-# downloading — image build + first boot + A/B pending.
-GLM_EXL3_DIR          := $(HOME)/src/glm53-exl3
+# GLM-5.3-Flash EXL3/TR3 4bpw + DFlash2 k=7 — the A/B lane against `make glm`.
+# SWITCHED 2026-09-10 from Reederey87's fork to MiaAI-Lab's ORIGINAL kit at
+# Leo's request (github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks @
+# 94bddea, clone + this pair's .env at ~/src/glm53-exl3-miaai; every local value
+# is marked LEO: in that .env). PULLED FORWARD to 1caea9a on 2026-09-11.
+# Upstream's only runtime-visible change in that range: the launcher now lets
+# ANY exported caller variable win over .env (it snapshots `compgen -e` instead
+# of a fixed whitelist), so the `set -a && . ./.env` in the launch command below
+# is now redundant — not harmful, it re-supplies the identical values. Nothing
+# under Dockerfile/overlay/files/ablit moved, so the image is unchanged in
+# substance; but `tests/` IS in start.sh's recipe stamp and one changed test
+# (tests/test_indexer_workspace.py) is COPYed at Dockerfile:462 of 495, so the
+# first launch after the pull rebuilds only the tail off the layer cache
+# (minutes, not the fork's ~40 min). SKIP_BUILD=1 skips it and warns about the
+# stamp instead. GHCR's :exl3 is itself stale (built 2026-09-07, stamp
+# 825e3374), so pulling the image would not settle the stamp either.
+#
+# 2026-09-13: PULLED 1caea9a -> f906ee9 (30 commits). Mostly launcher hardening:
+# RoCE GID now validated on every listed CX7 HCA, PYTORCH_CUDA_ALLOC_CONF
+# overridable, jinja2 host-python lookup for chat-template validation,
+# comma-separated dual-rail IB device names, and tests/bench_decode.py gained
+# native API_KEY/VLLM_API_KEY auth (the hand-patched copy is no longer needed --
+# /tmp/bench_leo.py is now just a BASE/MODEL sed of the stock harness).
+# TWO CHANGES OF SUBSTANCE:
+#  1. The hand-written --cudagraph-capture-sizes list was REMOVED from
+#     EXTRA_ARGS in the kit's .env. start.sh:193-211 now derives the list from
+#     GLM53_ADAPTIVE_K_SET + MAX_NUM_SEQS, but ONLY when the caller has not
+#     supplied the flag -- ours had, so it was silently overriding the new
+#     automatic list. Verified at boot: the derived list is
+#     "1 2 3 4 5 6 8 9 10 12 15 16 20 24 32", byte-identical to the manual one,
+#     and it now tracks the k-set on its own. (GLM53_ADAPTIVE_K itself still
+#     defaults to off despite PR #169's title; the explicit ema still does it.)
+#  2. GLM53_APC_RETENTION_INTERVAL_SWA exists now and is deliberately LEFT
+#     EMPTY. It looks like the fix for the prefix-caching loss noted above as
+#     the cost of leaving the fork. It is NOT: upstream's own qualification
+#     measured, matched at 128K on a 2x Spark, edit-at-90% 112.49 s vs 14.70 s
+#     and branch-at-90% 99.89 s vs 3.35 s, reusing ZERO tokens where the old
+#     runtime reused 111,104. Edit-and-branch at depth is exactly this lane's
+#     agent workload. Full reasoning is in the LEO 2026-09-13 block in the .env.
+# Re-benched after the pull (same protocol, stock harness): structured
+# 73.5 tok/s (accept 0.980), prose 32.4 (0.525) -- against 72.4 / 33.1 on
+# 2026-09-11, i.e. unchanged within run-to-run noise, which is what a
+# launcher-only range should do. KV pool still 883,552 / 1.04x at 850k.
+#
+# What changed by switching:
+#   + No image build. MiaAI ships a prebuilt multi-arch image
+#     ghcr.io/miaai-lab/glm-5.3-flash-2x-dgx-sparks:exl3, so the fork's ~40 min
+#     GPU-idle `docker build` step is gone (target removed below).
+#   + Binds 0.0.0.0 out of the box, so no local start.sh edit is needed. The
+#     port is protected by VLLM_API_KEY in the .env instead, with the matching
+#     api_key on the LiteLLM glm-5.3-flash-exl3 entry — the fork bound loopback.
+#   + Upstream HEAD is current (2026-09-10) vs the b5ab8091 the fork vendored.
+#   - LOSES the fork's fine-grained prefix caching at 64-token grain, its
+#     per-group KV retention and its long-prefill fairness cap. Those are the
+#     reason the fork was picked in the first place (multi-turn agent TTFT
+#     ~4 s -> ~1 s). MiaAI's own README says hits land only on 3584-token pages.
+#     If multi-turn agent latency regresses, that is the first thing to suspect.
+#   ~ Different serving shape: MNBT 7168 (not 3584), a MiaAI PROD value, and
+#     850K ctx as of 2026-09-11. It did NOT fit at first (boot died in
+#     _initialize_kv_caches: 13.46 GiB KV needed vs 11.8 available at gmu 0.85,
+#     vLLM estimating a 616448 ceiling), so the lane ran at 600K for a day.
+#     What made 850K fit is the FP8-dense opt-in, now on in the kit's .env:
+#     GLM53_DENSE_FP8=dense,kda frees GPU memory and EXTRA_ARGS pins
+#     --kv-cache-memory-bytes to 14 GiB so that memory becomes a pool big enough
+#     for one 850K request (measured 883,552 tokens / 1.04x) instead of growing
+#     into host RAM. GLM53_ADAPTIVE_K=ema is on with it (k chosen per request
+#     from 2/4/7) and needs the --cudagraph-capture-sizes list in the same
+#     EXTRA_ARGS. gmu stays 0.85. 900K — the value the 2026-09-07 CHANGELOG
+#     shipped before upstream lowered it to 850K — is untested here.
+#     Benched on this pair 2026-09-11 (temp 0, thinking off, 400 tok, median of
+#     5, tests/bench_decode.py): structured 64.5 -> 72.4 tok/s (accept 0.938 ->
+#     0.956), prose 27.8 -> 33.1 (0.341 -> 0.499). Both now beat upstream's
+#     published 65.1 / 32.1.
+#     TWO CAVEATS. (1) FP8 dense is upstream-PROVISIONAL and does move target
+#     numerics (KL proxy 0.002-0.013 nats/position, no full KLD panel) — unlike
+#     DFlash2 spec decode, which is bit-exact. (2) Host headroom is thinner than
+#     upstream's: head MemAvailable ~2.9 GiB where their 14 GiB cap left ~5, and
+#     earlyoom here runs -m 2 (~2.4 GiB) with --prefer vllm. That is the same
+#     failure recorded under `flush` below. Watch it; the lever if it bites is
+#     gmu (each 0.01 is ~1.2 GiB of host headroom), not the KV cap, which cannot
+#     go below ~13.5 GiB without the boot refusing an 850K request.
+#     ROLLBACK to the 600K/BF16 shape: .env.bak-600k-20260911 in the kit dir.
+#     Weights are the SAME brandonmusic snapshot 1ae6d70
+#     already in the head cache (MODEL_CACHE_NAME pins it so nothing re-downloads);
+#     MiaAI mirror the bytes of 5ab363a8, five hours earlier the same day.
+#     The drafter pin moves to dc77ff1, which this cache already holds.
+#
+# ROLLBACK: the fork clone is untouched at ~/src/glm53-exl3 (its .env, and the
+# unmodified start.sh which still binds 127.0.0.1). Point GLM_EXL3_DIR back at
+# it, restore `local/prod-start.sh` as the launch command below, and re-add the
+# glm-exl3-build / glm-exl3-dry targets from git history.
+GLM_EXL3_DIR          := $(HOME)/src/glm53-exl3-miaai
 # PARKED 2026-09-08 — superseded by `make qwen-flash` (tonyd2wild lane, below),
 # which was verified on this pair the same day. The launch/dry/logs targets are
 # commented out, not deleted: uncomment them (and `make qwen-flash` off) to roll
@@ -242,8 +336,8 @@ RUN := $(SPARKRUN) run --cluster $(CLUSTER)
 # The worker node (node_1), addressed over the cluster link the way sparkrun does.
 WORKER ?= 10.100.200.1
 
-.PHONY: help deepseek glm glm-exl3 glm-exl3-build qwen38fn-sglang qwen-flash qwen-flash-no-thinking qwen-flash-sync \
-        deepseek-dry glm-dry glm-exl3-dry qwen-flash-dry \
+.PHONY: help deepseek deepseek-sparkrun glm glm-exl3 qwen38fn-sglang qwen-flash qwen-flash-no-thinking qwen-flash-sync \
+        deepseek-dry glm-dry qwen-flash-dry \
         stop stop-deepseek stop-glm stop-glm-exl3 stop-qwen38fn stop-qwen38fn-sglang stop-qwen-flash \
         status logs logs-glm-exl3 logs-qwen-flash list flush patch-sparkrun cache-flusher stop-cache-flusher
 # (qwen38fn, qwen38fn-dry, logs-qwen38fn left out on purpose: parked 2026-09-08, see the MiaAI block)
@@ -254,7 +348,10 @@ help: ## Show this help
 
 ## --- launch ---------------------------------------------------------------
 
-deepseek: cache-flusher ## Launch DeepSeek-V4-Flash-Vision-Exp + DSpark k=5 (tonyd2wild vision port, 2-node, NVFP4 KV, 1M ctx)
+deepseek: flush cache-flusher ## Launch DeepSeek-V4-Flash-Vision-Exp + DSpark MTP=6 (MiaAI-Lab kit, 2-node, NVFP4 KV, 1M ctx)
+	cd $(DEEPSEEK_MIAAI_DIR) && ./start-deepseek-v4-flash-dspark.sh
+
+deepseek-sparkrun: cache-flusher ## ROLLBACK: the tonyd2wild sparkrun recipe (DSpark k=5, 12 seqs, gmu 0.85)
 	$(RUN) $(DEEPSEEK_RECIPE) $(OVERRIDES)
 
 # `flush` first, since 2026-09-05: NVRM refused part of the 6 GiB KV carve-out at
@@ -290,11 +387,8 @@ deepseek: cache-flusher ## Launch DeepSeek-V4-Flash-Vision-Exp + DSpark k=5 (ton
 glm: flush patch-sparkrun cache-flusher ## Launch GLM-5.3-Flash NVFP4 + DFlash2 k=7 spec decode (local, 2-node, 256K ctx)
 	$(RUN) $(GLM_RECIPE) $(OVERRIDES)
 
-glm-exl3: flush cache-flusher ## Launch GLM-5.3-Flash EXL3 4bpw + DFlash2 k=7 (Reederey87 kit, 2-node, 1M ctx) — A/B lane
-	cd $(GLM_EXL3_DIR) && set -a && . ./.env && set +a && local/prod-start.sh
-
-glm-exl3-build: ## Build the EXL3 serving image glm53-selfbuild on the head (~40 min, GPU must be idle: RAM)
-	cd $(GLM_EXL3_DIR) && docker build -t glm53-selfbuild . 2>&1 | tee ~/bench/glm53-exl3-build-$$(date +%Y%m%d-%H%M).log | tail -5
+glm-exl3: flush cache-flusher ## Launch GLM-5.3-Flash EXL3 4bpw + DFlash2 k=7 (MiaAI-Lab kit, 2-node, 850K ctx, FP8 dense + adaptive-k) — A/B lane
+	cd $(GLM_EXL3_DIR) && set -a && . ./.env && set +a && ./start.sh start
 
 # PARKED 2026-09-08 — superseded by `make qwen-flash`; uncomment to roll back to the MiaAI kit.
 #qwen38fn: flush ## Launch Qwen3.8-Flash-Next NVFP4 (MiaAI vLLM TP2+EP+MTP3 kit, 2-node, 262K ctx, bf16 KV)
@@ -326,9 +420,6 @@ deepseek-dry: ## Estimate VRAM/context fit for DeepSeek-V4-Flash-Vision-Exp + DS
 
 glm-dry: ## Estimate VRAM/context fit for GLM-5.3-Flash NVFP4 + DFlash2
 	$(RUN) $(GLM_RECIPE) $(OVERRIDES) --dry-run
-
-glm-exl3-dry: ## Validate the EXL3 kit config (.env, fabric pins, GID tables) without launching
-	cd $(GLM_EXL3_DIR) && set -a && . ./.env && set +a && ./start.sh validate
 
 # PARKED 2026-09-08 with `make qwen38fn` (MiaAI kit); uncomment together.
 #qwen38fn-dry: ## Preflight the MiaAI Qwen3.8 kit: .env, worker SSH, weights on both nodes (no launch)
@@ -381,16 +472,18 @@ stop-cache-flusher: ## Stop the page-cache flusher on both nodes (it also exits 
 	-[ -f $(HOME)/.cache_flusher.pid ] && kill $$(cat $(HOME)/.cache_flusher.pid) 2>/dev/null; true
 	-ssh -o BatchMode=yes -o ConnectTimeout=10 $(WORKER) '[ -f ~/.cache_flusher.pid ] && kill $$(cat ~/.cache_flusher.pid) 2>/dev/null; true'
 
-stop: ## Stop all workloads on the cluster (sparkrun lanes + the Qwen, qwen-flash and GLM-EXL3 kits)
+stop: ## Stop all workloads on the cluster (sparkrun lanes + the Qwen, qwen-flash, GLM-EXL3 and DeepSeek kits)
 	$(SPARKRUN) stop --all --cluster $(CLUSTER)
+	-cd $(DEEPSEEK_MIAAI_DIR) && ./stop-deepseek-v4-flash-dspark.sh
 	-cd $(QWEN38FN_DIR) && ./stop.sh
 	-cd $(GLM_EXL3_DIR) && set -a && . ./.env && set +a && ./start.sh stop
 	-docker rm -f vllm_qwen38fn 2>/dev/null
 	-ssh -o BatchMode=yes -o ConnectTimeout=10 $(WORKER) docker rm -f vllm_qwen38fn 2>/dev/null
 	-$(MAKE) --no-print-directory stop-cache-flusher
 
-stop-deepseek: ## Stop just the DeepSeek-V4-Flash-Vision-Exp + DSpark workload
-	$(SPARKRUN) stop $(DEEPSEEK_RECIPE) --cluster $(CLUSTER)
+stop-deepseek: ## Stop the DeepSeek lane (MiaAI kit; also clears the sparkrun rollback lane)
+	-cd $(DEEPSEEK_MIAAI_DIR) && ./stop-deepseek-v4-flash-dspark.sh
+	-$(SPARKRUN) stop $(DEEPSEEK_RECIPE) --cluster $(CLUSTER)
 
 stop-glm: ## Stop just the GLM-5.3-Flash NVFP4 + DFlash2 workload
 	$(SPARKRUN) stop $(GLM_RECIPE) --cluster $(CLUSTER)
@@ -430,7 +523,7 @@ logs: ## Tail the running workload's logs (or a specific one: make logs TARGET=<
 	echo "sparkrun logs $$target"; \
 	$(SPARKRUN) logs $$target
 
-logs-glm-exl3: ## Tail the GLM EXL3 head container (kit launcher; `make logs` cannot see it)
+logs-glm-exl3: ## Tail the GLM EXL3 head container (MiaAI kit launcher; `make logs` cannot see it)
 	cd $(GLM_EXL3_DIR) && set -a && . ./.env && set +a && ./start.sh logs
 
 # PARKED 2026-09-08 with `make qwen38fn` (MiaAI kit); the stop targets stay live for cleanup.
