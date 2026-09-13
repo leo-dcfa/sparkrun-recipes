@@ -3,6 +3,7 @@
 #
 # make deepseek                         # launch DeepSeek-V4-Flash-Vision-Exp + DSpark MTP=6, NVFP4 KV, 1M ctx (MiaAI-Lab kit, NOT sparkrun)
 # make deepseek-sparkrun                # ROLLBACK lane: the tonyd2wild sparkrun recipe this replaced (k=5, 12 seqs)
+# make ds41                             # launch DeepSeek-V4.1-Flash EXL3 2.9bpw (MiaAI-Lab kit, 552B, text-only, 600K ctx) -- NEEDS WEIGHTS, see below
 # make glm                              # launch GLM-5.3-Flash NVFP4 + DFlash2 k=7 spec decode (320B/18B-A multimodal MoE)
 # make glm-exl3                         # launch GLM-5.3-Flash EXL3 4bpw + DFlash2 k=7, 850K ctx (MiaAI-Lab kit, NOT sparkrun) — A/B lane vs `make glm`
 # make qwen38fn                         # PARKED 2026-09-08 (commented out below; MiaAI vLLM TP2+EP+MTP3 kit) — superseded by `make qwen-flash`
@@ -92,6 +93,35 @@ DEEPSEEK_RECIPE       := recipes/deepseek-v4-flash-vision-exp.yaml
 # MXFP4_INDEXER_CACHE) are experimental opt-ins — turn on ONE at a time with a
 # measurement, never as a batch.
 DEEPSEEK_MIAAI_DIR    := $(HOME)/src/miaai-ds4-dspark
+# DeepSeek-V4.1-Flash EXL3 2.9bpw -- ADDED 2026-09-13, a SECOND DeepSeek lane.
+# It does NOT replace `make deepseek`: that stays the V4-Flash Vision-Exp lane
+# and remains the only vision-capable DeepSeek here (this one is text-only,
+# LANGUAGE_MODEL_ONLY=1 upstream). Kit: MiaAI-Lab/DeepSeek-v4.1-Flash-EXL3-2x-
+# DGX-Sparks @ 8530568, clone + this pair's .env at ~/src/ds41-exl3-miaai
+# (local values marked LEO: in that .env).
+#
+# Why this lane is interesting: V4.1-Flash is 552B (vs V4-Flash's 284B) and
+# until now needed FOUR Sparks. Two things make 2 nodes work -- EXL3 at an
+# average 2.9 bpw (mul1 codebook, per-tensor K: routed experts K=3 except
+# layers 18-22 at K=2, shared experts K=5/4), and the ~190 GiB Engram n-gram
+# tables being served FILE-BACKED over NFS/ZFS instead of resident in the GPU
+# pool. Upstream on 2x GB10: 31.6 tok/s single stream, 42.5 aggregate at x2,
+# ~1,041 tok/s prefill at 10k, 810 tok/s on a 601k prompt (742 s TTFT).
+# For contrast the only other 2x V4.1 recipe (sfxnz) is 2.0 bpw / 21.2 tok/s,
+# and 2.0 bpw is below the bitrate where EXL3 quality falls off a cliff on a
+# comparable MoE, so 2.9 is the materially better lane.
+#
+# NOT RUNNABLE UNTIL THE WEIGHTS ARE FETCHED -- ~387 GiB, nothing cached:
+#   cd $(DS41_DIR) && ./download.sh          # 197 GiB EXL3 + 190 GiB Engram
+#   ./start.sh share                         # export Engram over NFS (default)
+#   ./start.sh pack                          # ...or local NVMe, +25-50% prefill
+# Then `make ds41`. First boot is ~25 min.
+#
+# HEADROOM: upstream budgets ~116 GiB of a 121 GiB node and notes long prompts
+# reaching a 2.1 GiB MemAvailable floor. earlyoom here is -m 2 (~2.4 GiB) with
+# --prefer vllm, so this sits CLOSER to the kill line than GLM-EXL3 at 850k
+# (~2.9 GiB). Watch the first long prefill; `flush` is a prerequisite below.
+DS41_DIR              := $(HOME)/src/ds41-exl3-miaai
 # GLM-5.3-Flash NVFP4 + DFlash2 speculative decoding (320B total / 18B active,
 # natively multimodal MoE). tonyd2wild's lane, adopted 2026-08-30, re-synced
 # 2026-09-03 (KV pin 3 -> 6 GiB: 0 preemptions under load vs 6, pool 310K ->
@@ -336,7 +366,7 @@ RUN := $(SPARKRUN) run --cluster $(CLUSTER)
 # The worker node (node_1), addressed over the cluster link the way sparkrun does.
 WORKER ?= 10.100.200.1
 
-.PHONY: help deepseek deepseek-sparkrun glm glm-exl3 qwen38fn-sglang qwen-flash qwen-flash-no-thinking qwen-flash-sync \
+.PHONY: help deepseek deepseek-sparkrun ds41 ds41-status logs-ds41 stop-ds41 glm glm-exl3 qwen38fn-sglang qwen-flash qwen-flash-no-thinking qwen-flash-sync \
         deepseek-dry glm-dry qwen-flash-dry \
         stop stop-deepseek stop-glm stop-glm-exl3 stop-qwen38fn stop-qwen38fn-sglang stop-qwen-flash \
         status logs logs-glm-exl3 logs-qwen-flash list flush patch-sparkrun cache-flusher stop-cache-flusher
@@ -353,6 +383,15 @@ deepseek: flush cache-flusher ## Launch DeepSeek-V4-Flash-Vision-Exp + DSpark MT
 
 deepseek-sparkrun: cache-flusher ## ROLLBACK: the tonyd2wild sparkrun recipe (DSpark k=5, 12 seqs, gmu 0.85)
 	$(RUN) $(DEEPSEEK_RECIPE) $(OVERRIDES)
+
+ds41: flush cache-flusher ## Launch DeepSeek-V4.1-Flash EXL3 2.9bpw (MiaAI kit, 2-node, 600K ctx, text-only) -- needs ./download.sh first
+	cd $(DS41_DIR) && ./start.sh start
+
+ds41-status: ## Status of the DeepSeek-V4.1 EXL3 lane
+	cd $(DS41_DIR) && ./start.sh status
+
+logs-ds41: ## Tail the DeepSeek-V4.1 EXL3 head container
+	cd $(DS41_DIR) && ./start.sh logs
 
 # `flush` first, since 2026-09-05: NVRM refused part of the 6 GiB KV carve-out at
 # boot (dmesg: NV_ERR_NO_MEMORY from _memdescAllocInternal @ mem_desc.c:1359, one
@@ -475,6 +514,7 @@ stop-cache-flusher: ## Stop the page-cache flusher on both nodes (it also exits 
 stop: ## Stop all workloads on the cluster (sparkrun lanes + the Qwen, qwen-flash, GLM-EXL3 and DeepSeek kits)
 	$(SPARKRUN) stop --all --cluster $(CLUSTER)
 	-cd $(DEEPSEEK_MIAAI_DIR) && ./stop-deepseek-v4-flash-dspark.sh
+	-cd $(DS41_DIR) && ./start.sh stop
 	-cd $(QWEN38FN_DIR) && ./stop.sh
 	-cd $(GLM_EXL3_DIR) && set -a && . ./.env && set +a && ./start.sh stop
 	-docker rm -f vllm_qwen38fn 2>/dev/null
@@ -487,6 +527,9 @@ stop-deepseek: ## Stop the DeepSeek lane (MiaAI kit; also clears the sparkrun ro
 
 stop-glm: ## Stop just the GLM-5.3-Flash NVFP4 + DFlash2 workload
 	$(SPARKRUN) stop $(GLM_RECIPE) --cluster $(CLUSTER)
+
+stop-ds41: ## Stop just the DeepSeek-V4.1-Flash EXL3 workload
+	-cd $(DS41_DIR) && ./start.sh stop
 
 stop-glm-exl3: ## Stop just the GLM-5.3-Flash EXL3 workload (glm53-exl3-head/-worker)
 	cd $(GLM_EXL3_DIR) && set -a && . ./.env && set +a && ./start.sh stop
