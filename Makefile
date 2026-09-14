@@ -5,7 +5,7 @@
 # make deepseek-sparkrun                # ROLLBACK lane: the tonyd2wild sparkrun recipe this replaced (k=5, 12 seqs)
 # make ds41                             # launch DeepSeek-V4.1-Flash EXL3 2.9bpw (MiaAI-Lab kit, 552B, text-only, 600K ctx) -- NEEDS WEIGHTS, see below
 # make glm-exl3                         # launch GLM-5.3-Flash EXL3 4bpw + DFlash2 k=7, 850K ctx (MiaAI-Lab kit, NOT sparkrun) — the GLM 5.3 lane
-# make qwen38fn                         # PARKED 2026-09-08 (commented out below; MiaAI vLLM TP2+EP+MTP3 kit) — superseded by `make qwen-flash`
+# make qwen38fn                         # launch Qwen3.8-Flash-Next NVFP4 (MiaAI kit, nvidia ckpt, fp8 KV, YaRN 1M ctx) — the qwen-flash lane
 # make qwen-flash                       # launch Qwen3.8-Flash-Next NVFP4 (nvidia ckpt), tonyd2wild vLLM TP2 SPEED lane, 262K ctx, thinking ON (2-node, NOT sparkrun)
 # make qwen-flash-no-thinking           # same lane, enable_thinking false server-side
 # make deepseek MAX_MODEL_LEN=500000    # override context length
@@ -357,8 +357,8 @@ RUN := $(SPARKRUN) run --cluster $(CLUSTER)
 # The worker node (node_1), addressed over the cluster link the way sparkrun does.
 WORKER ?= 10.100.200.1
 
-.PHONY: help deepseek deepseek-sparkrun ds41 ds41-status logs-ds41 stop-ds41 glm-exl3 qwen38fn-sglang qwen-flash qwen-flash-no-thinking qwen-flash-sync \
-        deepseek-dry qwen-flash-dry \
+.PHONY: help deepseek deepseek-sparkrun ds41 ds41-status logs-ds41 stop-ds41 glm-exl3 qwen38fn qwen38fn-sglang qwen-flash qwen-flash-no-thinking qwen-flash-sync \
+        deepseek-dry qwen38fn-dry qwen-flash-dry \
         stop stop-deepseek stop-glm-exl3 stop-qwen38fn stop-qwen38fn-sglang stop-qwen-flash \
         status logs logs-glm-exl3 logs-qwen-flash list flush patch-sparkrun cache-flusher stop-cache-flusher
 # (qwen38fn, qwen38fn-dry, logs-qwen38fn left out on purpose: parked 2026-09-08, see the MiaAI block)
@@ -417,9 +417,14 @@ logs-ds41: ## Tail the DeepSeek-V4.1 EXL3 head container
 glm-exl3: flush cache-flusher ## Launch GLM-5.3-Flash EXL3 4bpw + DFlash2 k=7 (MiaAI-Lab kit, 2-node, 850K ctx, FP8 dense + adaptive-k) — the GLM 5.3 lane
 	cd $(GLM_EXL3_DIR) && set -a && . ./.env && set +a && ./start.sh start
 
-# PARKED 2026-09-08 — superseded by `make qwen-flash`; uncomment to roll back to the MiaAI kit.
-#qwen38fn: flush ## Launch Qwen3.8-Flash-Next NVFP4 (MiaAI vLLM TP2+EP+MTP3 kit, 2-node, 262K ctx, bf16 KV)
-#	cd $(QWEN38FN_DIR) && ./start.sh --launch
+# UN-PARKED 2026-09-15 at Leo's request: this is the qwen-flash lane now.
+# Reconfigured off its old defaults — nvidia NVFP4 checkpoint (RadixArk is NOT
+# on either Spark; that .env would have meant a ~133 GB download), fp8 KV, and
+# YaRN to 1M. Measured at boot 2026-09-15: KV pool 4,185,628 tokens = 4.19x
+# concurrency at a full 1M request, vs MAX_NUM_SEQS=3. `make qwen-flash`
+# (tonyd2wild) is still here and is still the faster lane at 262K.
+qwen38fn: flush ## Launch Qwen3.8-Flash-Next NVFP4 (MiaAI kit, 2-node, nvidia ckpt, fp8 KV, MTP3, YaRN 1M ctx)
+	cd $(QWEN38FN_DIR) && ./start.sh --launch
 
 qwen38fn-sglang: ## PARKED — tonyd2wild SGLang lane (dies on first real prefill); reference only
 	$(RUN) $(QWEN38FN_SGLANG_RECIPE) $(OVERRIDES)
@@ -445,9 +450,8 @@ qwen-flash-sync: ## Ship upstream's patch dir + the launcher to the worker (idem
 deepseek-dry: ## Estimate VRAM/context fit for DeepSeek-V4-Flash-Vision-Exp + DSpark
 	$(RUN) $(DEEPSEEK_RECIPE) $(OVERRIDES) --dry-run
 
-# PARKED 2026-09-08 with `make qwen38fn` (MiaAI kit); uncomment together.
-#qwen38fn-dry: ## Preflight the MiaAI Qwen3.8 kit: .env, worker SSH, weights on both nodes (no launch)
-#	cd $(QWEN38FN_DIR) && ./start.sh --no-download --no-launch && ./check-weights.sh
+qwen38fn-dry: ## Preflight the MiaAI Qwen3.8 kit: .env, worker SSH, weights on both nodes (no launch)
+	cd $(QWEN38FN_DIR) && ./start.sh --no-download --no-launch && ./check-weights.sh
 
 qwen-flash-dry: qwen-flash-sync ## Preflight the qwen-flash lane on both nodes: image, nvidia checkpoint, overlay files, RDMA, NICs (no launch)
 	CHECK=1 $(QWEN_FLASH_ENV) bash $(QWEN_FLASH_LAUNCHER) 0
