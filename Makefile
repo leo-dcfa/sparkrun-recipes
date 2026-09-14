@@ -4,8 +4,7 @@
 # make deepseek                         # launch DeepSeek-V4-Flash-Vision-Exp + DSpark MTP=6, NVFP4 KV, 1M ctx (MiaAI-Lab kit, NOT sparkrun)
 # make deepseek-sparkrun                # ROLLBACK lane: the tonyd2wild sparkrun recipe this replaced (k=5, 12 seqs)
 # make ds41                             # launch DeepSeek-V4.1-Flash EXL3 2.9bpw (MiaAI-Lab kit, 552B, text-only, 600K ctx) -- NEEDS WEIGHTS, see below
-# make glm                              # launch GLM-5.3-Flash NVFP4 + DFlash2 k=7 spec decode (320B/18B-A multimodal MoE)
-# make glm-exl3                         # launch GLM-5.3-Flash EXL3 4bpw + DFlash2 k=7, 850K ctx (MiaAI-Lab kit, NOT sparkrun) — A/B lane vs `make glm`
+# make glm-exl3                         # launch GLM-5.3-Flash EXL3 4bpw + DFlash2 k=7, 850K ctx (MiaAI-Lab kit, NOT sparkrun) — the GLM 5.3 lane
 # make qwen38fn                         # PARKED 2026-09-08 (commented out below; MiaAI vLLM TP2+EP+MTP3 kit) — superseded by `make qwen-flash`
 # make qwen-flash                       # launch Qwen3.8-Flash-Next NVFP4 (nvidia ckpt), tonyd2wild vLLM TP2 SPEED lane, 262K ctx, thinking ON (2-node, NOT sparkrun)
 # make qwen-flash-no-thinking           # same lane, enable_thinking false server-side
@@ -20,7 +19,7 @@ SPARKRUN ?= sparkrun
 CLUSTER  ?= leo-azl-2node
 
 # sparkrun lives in ~/.local/bin, which non-interactive shells (e.g.
-# `ssh spark-f31f make -C sparkrun-recipes glm`) don't have on PATH — without
+# `ssh spark-f31f make -C sparkrun-recipes deepseek`) don't have on PATH — without
 # this, make dies with the unhelpful "make: sparkrun: No such file or directory".
 export PATH := $(HOME)/.local/bin:$(PATH)
 
@@ -122,24 +121,16 @@ DEEPSEEK_MIAAI_DIR    := $(HOME)/src/miaai-ds4-dspark
 # --prefer vllm, so this sits CLOSER to the kill line than GLM-EXL3 at 850k
 # (~2.9 GiB). Watch the first long prefill; `flush` is a prerequisite below.
 DS41_DIR              := $(HOME)/src/ds41-exl3-miaai
-# GLM-5.3-Flash NVFP4 + DFlash2 speculative decoding (320B total / 18B active,
-# natively multimodal MoE). tonyd2wild's lane, adopted 2026-08-30, re-synced
-# 2026-09-03 (KV pin 3 -> 6 GiB: 0 preemptions under load vs 6, pool 310K ->
-# 679K tokens; --max-num-batched-tokens 8192) — see the yaml header for the
-# full why. Measured here that day, single-stream, warm, greedy,
-# 500-token code prompt: 34.5 tok/s thinking-on (46.8% draft acceptance), 41.3
-# thinking-off (60.0%), against the previous MTP-4 lane's ~21. Speculative
-# decoding verifies every drafted token against the full model, so accepted
-# output is bit-identical — speed, not a quality trade. Also switches the
-# checkpoint to RedHatAI (the ModelOpt build emits intermittent corrupted token
-# IDs on GB10, vLLM #54150, which desync tool-call parsing) and fixes vision,
-# which never actually worked on the old lane for want of a multimodal template.
-#
-# (The MTP-4 lane was retired the same day: it was `make glm` on the MiaAI v8
-#  image glm53-flash-sm121:v8 with LibertAIDAI weights. recipes/glm-5.3-flash-nvfp4.yaml
-#  and that image are both kept for rollback — point GLM_RECIPE back at the yaml.)
-GLM_RECIPE            := recipes/glm-5.3-flash-dflash2.yaml
-# GLM-5.3-Flash EXL3/TR3 4bpw + DFlash2 k=7 — the A/B lane against `make glm`.
+# (GLM-5.3-Flash NVFP4 retired 2026-09-14 at Leo's request — `make glm`, the
+#  tonyd2wild DFlash2 k=7 lane on recipes/glm-5.3-flash-dflash2.yaml (RedHatAI
+#  W4A4 ckpt, 256K ctx, vision + thinking on). Its LiteLLM entry glm-5.3-flash
+#  went the same day; `make glm-exl3` is now the only GLM 5.3 lane. Both recipe
+#  yamls are KEPT for rollback: glm-5.3-flash-dflash2.yaml and the older MTP-4
+#  glm-5.3-flash-nvfp4.yaml (MiaAI v8 image glm53-flash-sm121:v8, LibertAIDAI
+#  weights). To roll back: restore GLM_RECIPE + the glm/glm-dry/stop-glm targets
+#  from git history and re-add the LiteLLM entry.)
+# GLM-5.3-Flash EXL3/TR3 4bpw + DFlash2 k=7 — the GLM 5.3 lane (it was the A/B
+# partner of `make glm`, NVFP4, retired 2026-09-14).
 # SWITCHED 2026-09-10 from Reederey87's fork to MiaAI-Lab's ORIGINAL kit at
 # Leo's request (github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks @
 # 94bddea, clone + this pair's .env at ~/src/glm53-exl3-miaai; every local value
@@ -366,9 +357,9 @@ RUN := $(SPARKRUN) run --cluster $(CLUSTER)
 # The worker node (node_1), addressed over the cluster link the way sparkrun does.
 WORKER ?= 10.100.200.1
 
-.PHONY: help deepseek deepseek-sparkrun ds41 ds41-status logs-ds41 stop-ds41 glm glm-exl3 qwen38fn-sglang qwen-flash qwen-flash-no-thinking qwen-flash-sync \
-        deepseek-dry glm-dry qwen-flash-dry \
-        stop stop-deepseek stop-glm stop-glm-exl3 stop-qwen38fn stop-qwen38fn-sglang stop-qwen-flash \
+.PHONY: help deepseek deepseek-sparkrun ds41 ds41-status logs-ds41 stop-ds41 glm-exl3 qwen38fn-sglang qwen-flash qwen-flash-no-thinking qwen-flash-sync \
+        deepseek-dry qwen-flash-dry \
+        stop stop-deepseek stop-glm-exl3 stop-qwen38fn stop-qwen38fn-sglang stop-qwen-flash \
         status logs logs-glm-exl3 logs-qwen-flash list flush patch-sparkrun cache-flusher stop-cache-flusher
 # (qwen38fn, qwen38fn-dry, logs-qwen38fn left out on purpose: parked 2026-09-08, see the MiaAI block)
 
@@ -423,10 +414,7 @@ logs-ds41: ## Tail the DeepSeek-V4.1 EXL3 head container
 #   docker inspect <node_0> | grep -E "VLLM_HOST_IP|GLOO_SOCKET_IFNAME" -> 10.100.200.2 / enp1s0f0np0
 #   grep mq_connect_ip /tmp/sparkrun_serve.log (in-container)         -> 10.100.200.2, not 192.168.0.120
 # Cabling the 10GbE ports would make the patch redundant (wired default route).
-glm: flush patch-sparkrun cache-flusher ## Launch GLM-5.3-Flash NVFP4 + DFlash2 k=7 spec decode (local, 2-node, 256K ctx)
-	$(RUN) $(GLM_RECIPE) $(OVERRIDES)
-
-glm-exl3: flush cache-flusher ## Launch GLM-5.3-Flash EXL3 4bpw + DFlash2 k=7 (MiaAI-Lab kit, 2-node, 850K ctx, FP8 dense + adaptive-k) — A/B lane
+glm-exl3: flush cache-flusher ## Launch GLM-5.3-Flash EXL3 4bpw + DFlash2 k=7 (MiaAI-Lab kit, 2-node, 850K ctx, FP8 dense + adaptive-k) — the GLM 5.3 lane
 	cd $(GLM_EXL3_DIR) && set -a && . ./.env && set +a && ./start.sh start
 
 # PARKED 2026-09-08 — superseded by `make qwen-flash`; uncomment to roll back to the MiaAI kit.
@@ -456,9 +444,6 @@ qwen-flash-sync: ## Ship upstream's patch dir + the launcher to the worker (idem
 
 deepseek-dry: ## Estimate VRAM/context fit for DeepSeek-V4-Flash-Vision-Exp + DSpark
 	$(RUN) $(DEEPSEEK_RECIPE) $(OVERRIDES) --dry-run
-
-glm-dry: ## Estimate VRAM/context fit for GLM-5.3-Flash NVFP4 + DFlash2
-	$(RUN) $(GLM_RECIPE) $(OVERRIDES) --dry-run
 
 # PARKED 2026-09-08 with `make qwen38fn` (MiaAI kit); uncomment together.
 #qwen38fn-dry: ## Preflight the MiaAI Qwen3.8 kit: .env, worker SSH, weights on both nodes (no launch)
@@ -524,9 +509,6 @@ stop: ## Stop all workloads on the cluster (sparkrun lanes + the Qwen, qwen-flas
 stop-deepseek: ## Stop the DeepSeek lane (MiaAI kit; also clears the sparkrun rollback lane)
 	-cd $(DEEPSEEK_MIAAI_DIR) && ./stop-deepseek-v4-flash-dspark.sh
 	-$(SPARKRUN) stop $(DEEPSEEK_RECIPE) --cluster $(CLUSTER)
-
-stop-glm: ## Stop just the GLM-5.3-Flash NVFP4 + DFlash2 workload
-	$(SPARKRUN) stop $(GLM_RECIPE) --cluster $(CLUSTER)
 
 stop-ds41: ## Stop just the DeepSeek-V4.1-Flash EXL3 workload
 	-cd $(DS41_DIR) && ./start.sh stop
