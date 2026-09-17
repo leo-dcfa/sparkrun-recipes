@@ -96,7 +96,7 @@ DEEPSEEK_MIAAI_DIR    := $(HOME)/src/miaai-ds4-dspark
 # It does NOT replace `make deepseek`: that stays the V4-Flash Vision-Exp lane
 # and remains the only vision-capable DeepSeek here (this one is text-only,
 # LANGUAGE_MODEL_ONLY=1 upstream). Kit: MiaAI-Lab/DeepSeek-v4.1-Flash-EXL3-2x-
-# DGX-Sparks @ 8530568, clone + this pair's .env at ~/src/ds41-exl3-miaai
+# DGX-Sparks @ 8404ac7 (pulled 2026-09-17: docs, .env.example, opt-in cooperative MoE), clone + this pair's .env at ~/src/ds41-exl3-miaai
 # (local values marked LEO: in that .env).
 #
 # Why this lane is interesting: V4.1-Flash is 552B (vs V4-Flash's 284B) and
