@@ -342,7 +342,8 @@ endif
 # MiMo-V2.6-Flash-RL (Xiaomi; ~310B total / ~12B active, fp8 attention + MXFP4
 # experts, 1M native ctx, text + image + video + audio in) — tonyd2wild's vLLM
 # TP2 + DFlash k=7 kit, ADDED 2026-09-22 as `make mimo`
-# (github.com/tonyd2wild/MiMo-V2.6-Flash-2x-DGX-Spark @ 7dce2a5; clone + this
+# (github.com/tonyd2wild/MiMo-V2.6-Flash-2x-DGX-Spark @ a05d97d — cloned at
+# 7dce2a5, pulled the same day: docs-only thinking-off rebench; clone + this
 # pair's launch/mimo.env at ~/src/mimo26-flash-tony — every local value is
 # marked LEO: in that file). NOT a sparkrun recipe: the kit bind-mounts four
 # patched vLLM files over the image's copies (fused fp8 QKV loader for the
@@ -379,6 +380,14 @@ endif
 # (env/model/patches) or 125+ (docker) and still stop the target.
 # One model at a time: `make stop` first — serve.sh waits up to 150 s for
 # MemAvailable to reach GMU x 121.69 GiB and then runs docker anyway.
+# VERIFIED 2026-09-22, first launch: boot 14 min (head 663 s of shard reads at
+# ~10 s/shard from NVMe; the worker, copy still in page cache, 159 s), 83.0 GiB
+# weights/node, KV pool 1,950,120 tokens = 6.50x at 300K (13.14 GiB; boot log
+# offers --kv-cache-memory 13275789722 as the exact-fit pin), MemAvailable
+# 9.0/10.3 GiB head/worker after boot, 7.8/9.7 after a 76K prompt. Thinking
+# off by default (empty reasoning), enable_thinking=true -> reasoning in the
+# `reasoning` field, content clean; tools parse both ways; the kit's vision
+# test reads all four elements; 76,497-token needle answered in 65 s.
 MIMO26_DIR        := $(HOME)/src/mimo26-flash-tony
 MIMO26_MODEL      := /var/tmp/models/MiMo-V2.6-Flash-RL
 MIMO26_CACHE      := /var/tmp/mimo-cache
