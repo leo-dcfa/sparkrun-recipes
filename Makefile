@@ -342,8 +342,8 @@ endif
 # MiMo-V2.6-Flash-RL (Xiaomi; ~310B total / ~12B active, fp8 attention + MXFP4
 # experts, 1M native ctx, text + image + video + audio in) — tonyd2wild's vLLM
 # TP2 + DFlash k=7 kit, ADDED 2026-09-22 as `make mimo`
-# (github.com/tonyd2wild/MiMo-V2.6-Flash-2x-DGX-Spark @ a05d97d — cloned at
-# 7dce2a5, pulled the same day: docs-only thinking-off rebench; clone + this
+# (github.com/tonyd2wild/MiMo-V2.6-Flash-2x-DGX-Spark @ 18705d6 — cloned at
+# 7dce2a5, pulled to a05d97d (docs-only rebench) then 18705d6 (sampling defaults: --generation-config auto + repetition_penalty 1.05, REP_PENALTY in mimo.env; fixes agent tool-call loops), all 2026-09-22; clone + this
 # pair's launch/mimo.env at ~/src/mimo26-flash-tony — every local value is
 # marked LEO: in that file). NOT a sparkrun recipe: the kit bind-mounts four
 # patched vLLM files over the image's copies (fused fp8 QKV loader for the
