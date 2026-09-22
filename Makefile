@@ -374,9 +374,18 @@ endif
 # enable_thinking=false for flag-less requests so the proxy behaves as before;
 # a direct backend call without chat_template_kwargs thinks. No repetition
 # penalty (the tonyd2wild lane had 1.05 for agent tool-call loops; upstream
-# measured it flat on DFlash and removed it). NOT YET VERIFICATION-LAUNCHED here
-# (2026-09-22: GLM lane was live) — first `make mimo` builds the image and the
-# baseline in the skill ledger is still the vLLM lane's.
+# measured it flat on DFlash and removed it).
+# VERIFIED 2026-09-22 evening, third boot: at the kit's MEM_FRACTION_STATIC 0.93
+# and at 0.91 the 4 GiB MemAvailable guard killed the engine on BOTH ranks right
+# after the KV pool — FlashInfer's MoE autotune runs there and costs ~8.5 GB for
+# ~73 s (sampled minimum 5.5 GiB head / 6.7 GiB worker at 0.88). This pair runs
+# 0.88 (LEO in .env) and keeps the guard at 4; pool 1,224,832 tokens = 1.17x a
+# full 1M request. Boot ~7 min once the image exists (weights 96 s/rank on both
+# NVMe and NFS, autotune 73 s, capture 17 s). Smoke 42; proxy: no level = thinking
+# off, high = reasoning_content, tool calls parse. Decode (idle, temp 0, off,
+# median of 3): structured 82.7 / code 56.5 / prose 20.7 tok/s with DFlash
+# accepting 7.7 / 6.9 / 5.7 of 8 — a few % under the vLLM lane at one stream;
+# prefill 1,448 tok/s on a 97K needle (answered exactly), +24% over vLLM.
 MIMO26_DIR        := $(HOME)/src/mimo26-sglang-miaai
 
 # ROLLBACK lane `make mimo-vllm` (was `make mimo` 2026-09-22 until the SGLang kit
