@@ -8,6 +8,7 @@
 # make qwen38fn                         # launch Qwen3.8-Flash-Next NVFP4 (MiaAI kit, nvidia ckpt, fp8 KV, YaRN 1M ctx) — the qwen-flash lane
 # make qwen-flash                       # launch Qwen3.8-Flash-Next NVFP4 (nvidia ckpt), tonyd2wild vLLM TP2 SPEED lane, 262K ctx, thinking ON (2-node, NOT sparkrun)
 # make qwen-flash-no-thinking           # same lane, enable_thinking false server-side
+# make mimo                             # launch MiMo-V2.6-Flash-RL (Xiaomi 310B-A12B, tonyd2wild vLLM TP2 + DFlash k=7 kit, fp8 KV, 300K ctx, image+video+audio, thinking OFF server-side; NOT sparkrun)
 # make deepseek MAX_MODEL_LEN=500000    # override context length
 # make deepseek-dry                     # VRAM/fit estimate, no launch
 # make stop                             # stop everything on the cluster
@@ -338,6 +339,47 @@ ifneq ($(strip $(GMU)),)
 QWEN_FLASH_ENV += GMU=$(GMU)
 endif
 
+# MiMo-V2.6-Flash-RL (Xiaomi; ~310B total / ~12B active, fp8 attention + MXFP4
+# experts, 1M native ctx, text + image + video + audio in) — tonyd2wild's vLLM
+# TP2 + DFlash k=7 kit, ADDED 2026-09-22 as `make mimo`
+# (github.com/tonyd2wild/MiMo-V2.6-Flash-2x-DGX-Spark @ 7dce2a5; clone + this
+# pair's launch/mimo.env at ~/src/mimo26-flash-tony — every local value is
+# marked LEO: in that file). NOT a sparkrun recipe: the kit bind-mounts four
+# patched vLLM files over the image's copies (fused fp8 QKV loader for the
+# TP4-presharded checkpoint, SupportsEagle3 on the Omni wrapper so DFlash
+# works, fp8 KV that actually applies on the DiffKV backend, opt-in drafter
+# value scale DFLASH_VSCALE=1 — measured no gain upstream) plus a corrected
+# dflash/config.json (the release has a trailing comma) and soundfile/PyAV
+# for audio input, all staged in /var/tmp/mimo-cache by the kit's setup.sh.
+# Image ghcr.io/tonyd2wild/vllm-glm53-flash:sm121-v11-dflash2 — the same
+# public tag the parked glm53-dflash2 lane uses; its layers were already on
+# both nodes, so the pull was a re-tag. Weights 166 GiB (65 shards + the
+# DFlash drafter) at /var/tmp/models/MiMo-V2.6-Flash-RL on BOTH nodes: head
+# over Wi-Fi with `hf download`, worker rsync'd over CX7 by
+# `make mimo-sync-weights` (no NFS between this pair).
+# Upstream on 2x GB10, fp8 KV, 300K ctx, gmu 0.90, 8 seqs, DFlash 7, marlin
+# MoE, DeepGEMM off: 53.3 tok/s single stream (code 70.5, prose 25.9), 155.8
+# aggregate at x6, TTFT 0.37 s, prefill 1,947 tok/s at 2K down to 656 at 250K,
+# KV pool 1.87M tokens (six full 300K requests at once). 1M ctx is UNTESTED
+# upstream (a 1M request needs ~3.3x the per-request blocks); MAXLEN= in
+# launch/mimo.env or on the command line raises it.
+# Local deviations (all in launch/mimo.env): HEAD_IP 10.100.200.2, ADDR_RANGE
+# 10.100.200.0/24, PORT 8000 (kit: 8888) so LiteLLM and the dashboard find it
+# where every other lane serves. The worker's NIC/HCA (cross-wired pair: head
+# f0 / worker f1) go on its command line below — serve.sh lets the calling
+# environment win over the file. Served name mimo-v2.6-flash; thinking OFF
+# server-side (kit default, THINKING=false — with it on, reasoning can leak
+# into content for clients that do not read reasoning_content); a request
+# turns it on with chat_template_kwargs enable_thinking=true. Reasoning and
+# tool-call parsers are both `mimo`. Vendor sampling: temp 1.0, top_p 0.95.
+# Upstream's run order: worker (rank 1) first, then head; the target does that.
+# One model at a time: `make stop` first — serve.sh waits up to 150 s for
+# MemAvailable to reach GMU x 121.69 GiB and then runs docker anyway.
+MIMO26_DIR        := $(HOME)/src/mimo26-flash-tony
+MIMO26_MODEL      := /var/tmp/models/MiMo-V2.6-Flash-RL
+MIMO26_CACHE      := /var/tmp/mimo-cache
+MIMO26_WORKER_ENV := IFACE=enp1s0f1np1 HCA=rocep1s0f1
+
 # Optional overrides — set on the command line, e.g.
 # make deepseek MAX_MODEL_LEN=1000000 GPU_MEM=0.85
 MAX_MODEL_LEN ?=
@@ -358,9 +400,10 @@ RUN := $(SPARKRUN) run --cluster $(CLUSTER)
 WORKER ?= 10.100.200.1
 
 .PHONY: help deepseek deepseek-sparkrun ds41 ds41-status logs-ds41 stop-ds41 glm-exl3 qwen38fn qwen38fn-sglang qwen-flash qwen-flash-no-thinking qwen-flash-sync \
-        deepseek-dry qwen38fn-dry qwen-flash-dry \
-        stop stop-deepseek stop-glm-exl3 stop-qwen38fn stop-qwen38fn-sglang stop-qwen-flash \
-        status logs logs-glm-exl3 logs-qwen-flash list flush patch-sparkrun cache-flusher stop-cache-flusher
+        mimo mimo-sync mimo-sync-weights \
+        deepseek-dry qwen38fn-dry qwen-flash-dry mimo-dry \
+        stop stop-deepseek stop-glm-exl3 stop-qwen38fn stop-qwen38fn-sglang stop-qwen-flash stop-mimo \
+        status logs logs-glm-exl3 logs-qwen-flash logs-mimo list flush patch-sparkrun cache-flusher stop-cache-flusher
 # (qwen38fn, qwen38fn-dry, logs-qwen38fn left out on purpose: parked 2026-09-08, see the MiaAI block)
 
 help: ## Show this help
@@ -445,6 +488,20 @@ qwen-flash-sync: ## Ship upstream's patch dir + the launcher to the worker (idem
 	rsync -a --delete $(QWEN_FLASH_PATCHES)/ $(WORKER):patches/qwen4exp-ple-mmap/
 	rsync -a $(QWEN_FLASH_LAUNCHER) $(WORKER):qwen-flash-tp2.sh
 
+mimo: flush cache-flusher mimo-sync ## Launch MiMo-V2.6-Flash-RL (tonyd2wild kit, 2-node, vLLM TP2 + DFlash k=7, fp8 KV, 300K ctx, image+video+audio, thinking OFF server-side)
+	ssh -o BatchMode=yes -o ConnectTimeout=10 $(WORKER) 'cd ~/src/mimo26-flash-tony && $(MIMO26_WORKER_ENV) bash launch/serve.sh 1'
+	cd $(MIMO26_DIR) && bash launch/serve.sh 0
+	@echo "booting (~11 min to serve): make logs-mimo — ready when curl -s localhost:8000/v1/models lists mimo-v2.6-flash"
+
+mimo-sync: ## Ship the kit (launch/serve.sh + mimo.env, patches) and the staged patch files + audio libs to the worker (idempotent; rerun after a git pull or setup.sh)
+	ssh -o BatchMode=yes -o ConnectTimeout=10 $(WORKER) 'mkdir -p ~/src/mimo26-flash-tony $(MIMO26_CACHE)'
+	rsync -a --delete --exclude .git $(MIMO26_DIR)/ $(WORKER):src/mimo26-flash-tony/
+	rsync -a $(MIMO26_CACHE)/mimo_v2.py $(MIMO26_CACHE)/mimo_v2_omni.py $(MIMO26_CACHE)/triton_attn_diffkv.py $(MIMO26_CACHE)/qwen3_dflash.py $(MIMO26_CACHE)/dflash-config.fixed.json $(MIMO26_CACHE)/pyextra $(WORKER):$(MIMO26_CACHE)/
+
+mimo-sync-weights: ## Copy the 166 GiB MiMo checkpoint to the worker over the CX7 link (once; a rerun only checks)
+	ssh -o BatchMode=yes -o ConnectTimeout=10 $(WORKER) 'mkdir -p $(MIMO26_MODEL)'
+	rsync -a --exclude .cache --info=progress2 $(MIMO26_MODEL)/ $(WORKER):$(MIMO26_MODEL)/
+
 ## --- dry-run / VRAM fit estimate (no launch) ------------------------------
 
 deepseek-dry: ## Estimate VRAM/context fit for DeepSeek-V4-Flash-Vision-Exp + DSpark
@@ -456,6 +513,10 @@ qwen38fn-dry: ## Preflight the MiaAI Qwen3.8 kit: .env, worker SSH, weights on b
 qwen-flash-dry: qwen-flash-sync ## Preflight the qwen-flash lane on both nodes: image, nvidia checkpoint, overlay files, RDMA, NICs (no launch)
 	CHECK=1 $(QWEN_FLASH_ENV) bash $(QWEN_FLASH_LAUNCHER) 0
 	ssh -o BatchMode=yes -o ConnectTimeout=10 $(WORKER) 'CHECK=1 $(QWEN_FLASH_ENV) bash ~/qwen-flash-tp2.sh 1'
+
+mimo-dry: mimo-sync ## Preflight the MiMo lane on both nodes: model + staged patch files present, prints the docker run line (DRY_RUN, launches nothing)
+	cd $(MIMO26_DIR) && DRY_RUN=1 bash launch/serve.sh 0
+	ssh -o BatchMode=yes -o ConnectTimeout=10 $(WORKER) 'cd ~/src/mimo26-flash-tony && DRY_RUN=1 $(MIMO26_WORKER_ENV) bash launch/serve.sh 1'
 
 ## --- lifecycle ------------------------------------------------------------
 
@@ -500,7 +561,7 @@ stop-cache-flusher: ## Stop the page-cache flusher on both nodes (it also exits 
 	-[ -f $(HOME)/.cache_flusher.pid ] && kill $$(cat $(HOME)/.cache_flusher.pid) 2>/dev/null; true
 	-ssh -o BatchMode=yes -o ConnectTimeout=10 $(WORKER) '[ -f ~/.cache_flusher.pid ] && kill $$(cat ~/.cache_flusher.pid) 2>/dev/null; true'
 
-stop: ## Stop all workloads on the cluster (sparkrun lanes + the Qwen, qwen-flash, GLM-EXL3 and DeepSeek kits)
+stop: ## Stop all workloads on the cluster (sparkrun lanes + the Qwen, qwen-flash, GLM-EXL3, DeepSeek and MiMo kits)
 	$(SPARKRUN) stop --all --cluster $(CLUSTER)
 	-cd $(DEEPSEEK_MIAAI_DIR) && ./stop-deepseek-v4-flash-dspark.sh
 	-cd $(DS41_DIR) && ./start.sh stop
@@ -508,6 +569,8 @@ stop: ## Stop all workloads on the cluster (sparkrun lanes + the Qwen, qwen-flas
 	-cd $(GLM_EXL3_DIR) && set -a && . ./.env && set +a && ./start.sh stop
 	-docker rm -f vllm_qwen38fn 2>/dev/null
 	-ssh -o BatchMode=yes -o ConnectTimeout=10 $(WORKER) docker rm -f vllm_qwen38fn 2>/dev/null
+	-docker rm -f vllm_mimo 2>/dev/null
+	-ssh -o BatchMode=yes -o ConnectTimeout=10 $(WORKER) docker rm -f vllm_mimo 2>/dev/null
 	-$(MAKE) --no-print-directory stop-cache-flusher
 
 stop-deepseek: ## Stop the DeepSeek lane (MiaAI kit; also clears the sparkrun rollback lane)
@@ -530,7 +593,11 @@ stop-qwen-flash: ## Stop just the qwen-flash lane (vllm_qwen38fn on both nodes)
 	-docker rm -f vllm_qwen38fn
 	-ssh -o BatchMode=yes -o ConnectTimeout=10 $(WORKER) docker rm -f vllm_qwen38fn
 
-status: ## Show running sparkrun containers (+ the vllm-fn / qwen-flash / glm53-exl3 kit containers, if any)
+stop-mimo: ## Stop just the MiMo lane (vllm_mimo on both nodes)
+	-docker rm -f vllm_mimo
+	-ssh -o BatchMode=yes -o ConnectTimeout=10 $(WORKER) docker rm -f vllm_mimo
+
+status: ## Show running sparkrun containers (+ the vllm-fn / qwen-flash / glm53-exl3 / mimo kit containers, if any)
 	$(SPARKRUN) status --cluster $(CLUSTER)
 	@docker ps --filter name=vllm-fn --format 'vllm-fn (head):   {{.Status}}  {{.Image}}' 2>/dev/null || true
 	@ssh -o BatchMode=yes -o ConnectTimeout=5 $(WORKER) "docker ps --filter name=vllm-fn --format 'vllm-fn (worker): {{.Status}}  {{.Image}}'" 2>/dev/null || true
@@ -538,6 +605,8 @@ status: ## Show running sparkrun containers (+ the vllm-fn / qwen-flash / glm53-
 	@ssh -o BatchMode=yes -o ConnectTimeout=5 $(WORKER) "docker ps --filter name=glm53-exl3 --format 'glm53-exl3 (worker): {{.Status}}  {{.Image}}'" 2>/dev/null || true
 	@docker ps --filter name=vllm_qwen38fn --format 'qwen-flash (head):   {{.Status}}  {{.Image}}' 2>/dev/null || true
 	@ssh -o BatchMode=yes -o ConnectTimeout=5 $(WORKER) "docker ps --filter name=vllm_qwen38fn --format 'qwen-flash (worker): {{.Status}}  {{.Image}}'" 2>/dev/null || true
+	@docker ps --filter name=vllm_mimo --format 'mimo (head):   {{.Status}}  {{.Image}}' 2>/dev/null || true
+	@ssh -o BatchMode=yes -o ConnectTimeout=5 $(WORKER) "docker ps --filter name=vllm_mimo --format 'mimo (worker): {{.Status}}  {{.Image}}'" 2>/dev/null || true
 
 logs: ## Tail the running workload's logs (or a specific one: make logs TARGET=<job-id|recipe>)
 	@target="$(TARGET)"; \
@@ -561,6 +630,9 @@ logs-glm-exl3: ## Tail the GLM EXL3 head container (MiaAI kit launcher; `make lo
 
 logs-qwen-flash: ## Tail the qwen-flash head container (not a sparkrun job, so `make logs` cannot see it)
 	docker logs -f vllm_qwen38fn
+
+logs-mimo: ## Tail the MiMo head container (not a sparkrun job, so `make logs` cannot see it)
+	docker logs -f vllm_mimo
 
 list: ## List available recipes
 	$(SPARKRUN) list
