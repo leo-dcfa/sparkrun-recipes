@@ -373,6 +373,10 @@ endif
 # turns it on with chat_template_kwargs enable_thinking=true. Reasoning and
 # tool-call parsers are both `mimo`. Vendor sampling: temp 1.0, top_p 0.95.
 # Upstream's run order: worker (rank 1) first, then head; the target does that.
+# The `|| [ $$? -eq 1 ]` on the worker lines: serve.sh ends with a head-only
+# `[ "$$R" = 0 ] && echo`, so rank 1 exits 1 after a SUCCESSFUL docker run and
+# make would otherwise abort before the head starts. Real failures exit 2-4
+# (env/model/patches) or 125+ (docker) and still stop the target.
 # One model at a time: `make stop` first — serve.sh waits up to 150 s for
 # MemAvailable to reach GMU x 121.69 GiB and then runs docker anyway.
 MIMO26_DIR        := $(HOME)/src/mimo26-flash-tony
@@ -512,7 +516,7 @@ qwen-flash-sync: ## Ship upstream's patch dir + the launcher to the worker (idem
 	rsync -a $(QWEN_FLASH_LAUNCHER) $(WORKER):qwen-flash-tp2.sh
 
 mimo: flush cache-flusher mimo-sync ## Launch MiMo-V2.6-Flash-RL (tonyd2wild kit, 2-node, vLLM TP2 + DFlash k=7, fp8 KV, 300K ctx, image+video+audio, thinking OFF server-side)
-	ssh -o BatchMode=yes -o ConnectTimeout=10 $(WORKER) 'cd ~/src/mimo26-flash-tony && $(MIMO26_ENV) $(MIMO26_WORKER_ENV) bash launch/serve.sh 1'
+	ssh -o BatchMode=yes -o ConnectTimeout=10 $(WORKER) 'cd ~/src/mimo26-flash-tony && $(MIMO26_ENV) $(MIMO26_WORKER_ENV) bash launch/serve.sh 1 || [ $$? -eq 1 ]'
 	cd $(MIMO26_DIR) && $(MIMO26_ENV) bash launch/serve.sh 0
 	@echo "booting (~11 min to serve): make logs-mimo — ready when curl -s localhost:8000/v1/models lists mimo-v2.6-flash"
 
@@ -539,7 +543,7 @@ qwen-flash-dry: qwen-flash-sync ## Preflight the qwen-flash lane on both nodes: 
 
 mimo-dry: mimo-sync ## Preflight the MiMo lane on both nodes: model + staged patch files present, prints the docker run line (DRY_RUN, launches nothing)
 	cd $(MIMO26_DIR) && DRY_RUN=1 $(MIMO26_ENV) bash launch/serve.sh 0
-	ssh -o BatchMode=yes -o ConnectTimeout=10 $(WORKER) 'cd ~/src/mimo26-flash-tony && DRY_RUN=1 $(MIMO26_ENV) $(MIMO26_WORKER_ENV) bash launch/serve.sh 1'
+	ssh -o BatchMode=yes -o ConnectTimeout=10 $(WORKER) 'cd ~/src/mimo26-flash-tony && DRY_RUN=1 $(MIMO26_ENV) $(MIMO26_WORKER_ENV) bash launch/serve.sh 1 || [ $$? -eq 1 ]'
 
 ## --- lifecycle ------------------------------------------------------------
 
