@@ -361,8 +361,8 @@ endif
 # MoE, DeepGEMM off: 53.3 tok/s single stream (code 70.5, prose 25.9), 155.8
 # aggregate at x6, TTFT 0.37 s, prefill 1,947 tok/s at 2K down to 656 at 250K,
 # KV pool 1.87M tokens (six full 300K requests at once). 1M ctx is UNTESTED
-# upstream (a 1M request needs ~3.3x the per-request blocks); MAXLEN= in
-# launch/mimo.env or on the command line raises it.
+# upstream (a 1M request needs ~3.3x the per-request blocks); `make mimo
+# MAX_MODEL_LEN=1000000` (or MAXLEN in launch/mimo.env) raises it; knobs above RUN.
 # Local deviations (all in launch/mimo.env): HEAD_IP 10.100.200.2, ADDR_RANGE
 # 10.100.200.0/24, PORT 8000 (kit: 8888) so LiteLLM and the dashboard find it
 # where every other lane serves. The worker's NIC/HCA (cross-wired pair: head
@@ -392,6 +392,29 @@ OVERRIDES += --max-model-len $(MAX_MODEL_LEN)
 endif
 ifneq ($(strip $(GPU_MEM)),)
 OVERRIDES += --gpu-mem $(GPU_MEM)
+endif
+
+# Knobs for `make mimo*` (command line), forwarded to BOTH ranks — serve.sh lets
+# the calling environment win over launch/mimo.env: MAX_MODEL_LEN=1000000 (kit
+# tested 300000; 1M is untested upstream), GMU=, KV_DTYPE=fp8|auto (auto = bf16
+# KV, halves the pool), SEQS=, MIMO_THINKING=true|false (server default; kit false).
+SEQS          ?=
+MIMO_THINKING ?=
+MIMO26_ENV :=
+ifneq ($(strip $(MAX_MODEL_LEN)),)
+MIMO26_ENV += MAXLEN=$(MAX_MODEL_LEN)
+endif
+ifneq ($(strip $(GMU)),)
+MIMO26_ENV += GMU=$(GMU)
+endif
+ifneq ($(strip $(KV_DTYPE)),)
+MIMO26_ENV += KV_DTYPE=$(KV_DTYPE)
+endif
+ifneq ($(strip $(SEQS)),)
+MIMO26_ENV += SEQS=$(SEQS)
+endif
+ifneq ($(strip $(MIMO_THINKING)),)
+MIMO26_ENV += THINKING=$(MIMO_THINKING)
 endif
 
 RUN := $(SPARKRUN) run --cluster $(CLUSTER)
@@ -489,8 +512,8 @@ qwen-flash-sync: ## Ship upstream's patch dir + the launcher to the worker (idem
 	rsync -a $(QWEN_FLASH_LAUNCHER) $(WORKER):qwen-flash-tp2.sh
 
 mimo: flush cache-flusher mimo-sync ## Launch MiMo-V2.6-Flash-RL (tonyd2wild kit, 2-node, vLLM TP2 + DFlash k=7, fp8 KV, 300K ctx, image+video+audio, thinking OFF server-side)
-	ssh -o BatchMode=yes -o ConnectTimeout=10 $(WORKER) 'cd ~/src/mimo26-flash-tony && $(MIMO26_WORKER_ENV) bash launch/serve.sh 1'
-	cd $(MIMO26_DIR) && bash launch/serve.sh 0
+	ssh -o BatchMode=yes -o ConnectTimeout=10 $(WORKER) 'cd ~/src/mimo26-flash-tony && $(MIMO26_ENV) $(MIMO26_WORKER_ENV) bash launch/serve.sh 1'
+	cd $(MIMO26_DIR) && $(MIMO26_ENV) bash launch/serve.sh 0
 	@echo "booting (~11 min to serve): make logs-mimo — ready when curl -s localhost:8000/v1/models lists mimo-v2.6-flash"
 
 mimo-sync: ## Ship the kit (launch/serve.sh + mimo.env, patches) and the staged patch files + audio libs to the worker (idempotent; rerun after a git pull or setup.sh)
@@ -515,8 +538,8 @@ qwen-flash-dry: qwen-flash-sync ## Preflight the qwen-flash lane on both nodes: 
 	ssh -o BatchMode=yes -o ConnectTimeout=10 $(WORKER) 'CHECK=1 $(QWEN_FLASH_ENV) bash ~/qwen-flash-tp2.sh 1'
 
 mimo-dry: mimo-sync ## Preflight the MiMo lane on both nodes: model + staged patch files present, prints the docker run line (DRY_RUN, launches nothing)
-	cd $(MIMO26_DIR) && DRY_RUN=1 bash launch/serve.sh 0
-	ssh -o BatchMode=yes -o ConnectTimeout=10 $(WORKER) 'cd ~/src/mimo26-flash-tony && DRY_RUN=1 $(MIMO26_WORKER_ENV) bash launch/serve.sh 1'
+	cd $(MIMO26_DIR) && DRY_RUN=1 $(MIMO26_ENV) bash launch/serve.sh 0
+	ssh -o BatchMode=yes -o ConnectTimeout=10 $(WORKER) 'cd ~/src/mimo26-flash-tony && DRY_RUN=1 $(MIMO26_ENV) $(MIMO26_WORKER_ENV) bash launch/serve.sh 1'
 
 ## --- lifecycle ------------------------------------------------------------
 
