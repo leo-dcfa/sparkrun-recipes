@@ -218,10 +218,11 @@ DS41_DIR              := $(HOME)/src/ds41-exl3-miaai
 #     MiaAI mirror the bytes of 5ab363a8, five hours earlier the same day.
 #     The drafter pin moves to dc77ff1, which this cache already holds.
 #
-# ROLLBACK: the fork clone is untouched at ~/src/glm53-exl3 (its .env, and the
-# unmodified start.sh which still binds 127.0.0.1). Point GLM_EXL3_DIR back at
-# it, restore `local/prod-start.sh` as the launch command below, and re-add the
-# glm-exl3-build / glm-exl3-dry targets from git history.
+# (Reederey87 fork clone ~/src/glm53-exl3 REMOVED 2026-09-22 at Leo's request;
+# its site .env is archived in ~/src/.retired/. A rollback to that fork now means
+# re-cloning github.com/Reederey87/glm53-flash-exl3-2x-dgx-spark, restoring the
+# .env from the archive, and re-adding the glm-exl3-build / glm-exl3-dry targets
+# from git history.)
 GLM_EXL3_DIR          := $(HOME)/src/glm53-exl3-miaai
 # PARKED 2026-09-08 — superseded by `make qwen-flash` (tonyd2wild lane, below),
 # which was verified on this pair the same day. The launch/dry/logs targets are
