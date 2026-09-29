@@ -502,7 +502,9 @@ WORKERS3 := $(WORKER) $(WORKER2)
         stop stop-deepseek stop-glm-exl3 stop-qwen38fn stop-qwen38fn-sglang stop-qwen-flash stop-mimo stop-mimo-vllm \
         status logs logs-glm-exl3 logs-qwen-flash logs-mimo logs-mimo-vllm list flush patch-sparkrun cache-flusher stop-cache-flusher \
         glm-exl3-tp3 glm-exl3-tp3-status stop-glm-exl3-tp3 logs-glm-exl3-tp3 \
-        deepseek-tp3 deepseek-tp3-prepare deepseek-tp3-env stop-deepseek-tp3 flush3 cache-flusher3 free-nfs
+        deepseek-tp3 deepseek-tp3-prepare deepseek-tp3-env stop-deepseek-tp3 flush3 cache-flusher3 free-nfs \
+        jspark3 jspark3-verify jspark3-status logs-jspark3 stop-jspark3 \
+        ds41x3 ds41x3-build ds41x3-pack ds41x3-status logs-ds41x3 stop-ds41x3
 # (qwen38fn, qwen38fn-dry, logs-qwen38fn left out on purpose: parked 2026-09-08, see the MiaAI block)
 
 help: ## Show this help
@@ -656,6 +658,65 @@ deepseek-tp3: flush3 cache-flusher3 deepseek-tp3-env ## Launch DeepSeek-V4-Flash
 stop-deepseek-tp3: deepseek-tp3-env ## Stop the 3-node DeepSeek lane (all three ranks)
 	-cd $(DEEPSEEK_MIAAI_DIR) && ENV_FILE=$(DS4_TP3_ENV) ./stop-deepseek-v4-flash-dspark.sh
 
+# JSpark3 v1.8.4 (github.com/jakejharris/jspark3 @ 64220b0, Apache-2.0 + AGPL parts; the
+# DFlash2 draft it always loads is CC BY-NC-ND). GLM-5.3-Flash stock weights, TP3 + EP on
+# all three GB10s, its own image built on the head. Source + prepared runtime (operator.env,
+# receipts) live in ~/jspark3/src on f31f; each rank has ~/jspark3/{recipe-v1.8.4,models,
+# sources,work}. LOCAL PATCH: the prepared recipe's remote_preflight.py also accepts DMI
+# "AI TOP ATOM" (the Atom, same P4242 board) and its SHA256SUMS were re-sealed; the upstream
+# originals sit beside it as *.upstream-v1.8.4. Fixed by the recipe: API 0.0.0.0:8888 with
+# NO auth (jspark3-api-guard.service on f31f limits who can reach it), headless hosts
+# (multi-user.target, nvidia-drm modeset=1 fbdev=0), served name glm-5.3-flash.
+# A restart is always stop --remove + fresh preflight + start (~13 min).
+JSPARK3_RUNTIME := $(HOME)/jspark3/src/jspark3-runtime-v1.8.4
+JSPARK3_FLEET   := cd $(JSPARK3_RUNTIME)/recipe && python3 -B scripts/fleetctl.py
+
+jspark3: flush3 ## Launch JSpark3 v1.8.4 on THREE nodes (GLM-5.3-Flash TP3, :8888, served glm-5.3-flash; preflight ~5 min + start ~8 min)
+	@if [ -e $(JSPARK3_RUNTIME)/service.json ]; then echo "JSpark3 is running (service.json exists): make stop-jspark3 first" >&2; exit 1; fi
+	$(JSPARK3_FLEET) preflight --env-file ../operator.env --output ../preflight.json
+	$(JSPARK3_FLEET) start --env-file ../operator.env --preflight ../preflight.json --preflight-sha256 $$(sha256sum ../preflight.json | cut -d' ' -f1) --manifest ../service.json --confirm START-JSPARK3
+
+jspark3-verify: ## JSpark3's own end-to-end verify (health, correctness, >32K retrieval, memory/no-swap)
+	$(JSPARK3_FLEET) verify --env-file ../operator.env --manifest ../service.json --output ../verify.json --log-output ../verify-rank0.log
+
+jspark3-status: ## Status of the JSpark3 fleet
+	$(JSPARK3_FLEET) status --env-file ../operator.env --manifest ../service.json
+
+logs-jspark3: ## Tail the JSpark3 rank-0 container
+	docker logs -f --tail 200 jspark3-v16-rank0
+
+stop-jspark3: ## Stop AND remove JSpark3's three rank containers (a restart needs a fresh preflight anyway)
+	-$(JSPARK3_FLEET) stop --env-file ../operator.env --manifest ../service.json --confirm STOP-JSPARK3 --remove --remove-confirm REMOVE-JSPARK3 && mv $(JSPARK3_RUNTIME)/service.json $(JSPARK3_RUNTIME)/service-stopped-$$(date +%Y%m%dT%H%M%S).json
+	tools/jspark3-archive-evidence.sh $(WORKER) $(WORKER2)
+
+# DeepSeek-V4.1-Flash NATIVE weights on three nodes: MiaAI-Lab/DeepSeek-v4.1-Flash-DGX-Sparks
+# @ cad252b (SGLang, AGPL-3.0; weights MIT), cloned 2026-09-29 as ~/src/ds41-sglang-miaai.
+# Full local checkpoint on every node (NFS_SHARE=0: its exporter would fight mimo26-nfs /
+# glm53-nfs for the head's nfsd), workers via the dsv41-local-weights bind volume; Engram
+# rows packed per rank to ~/dsv41-engram (r?of3, beside the EXL3 lane's r?of2). 256K ctx,
+# :8000, API_KEY in the kit's .env. HAZARD: the kit's stop.sh removes containers matching
+# the SUBSTRING dsv41- — that includes the 2-node DS4.1 EXL3 lane's dsv41-exl3-*. Harmless
+# while only one lane runs; never call it with the EXL3 lane up.
+DS41X3_DIR := $(HOME)/src/ds41-sglang-miaai
+
+ds41x3-build: ## One-time/after a pull: build the DS4.1 3-node SGLang overlay image on every node (pulls the pinned base)
+	cd $(DS41X3_DIR) && ./start.sh build
+
+ds41x3-pack: ## One-time/after a TP or weights change: pack each rank's Engram rows to NVMe (~10 min, ~63 GiB/node)
+	cd $(DS41X3_DIR) && ./start.sh pack
+
+ds41x3: flush3 cache-flusher3 ## Launch DeepSeek-V4.1-Flash native on THREE nodes (MiaAI SGLang kit, TP3, 256K ctx, served deepseek-v4.1-flash; boot ~13 min)
+	cd $(DS41X3_DIR) && ./start.sh serve
+
+ds41x3-status: ## Status of the DS4.1 3-node lane
+	cd $(DS41X3_DIR) && ./start.sh status
+
+logs-ds41x3: ## Tail the DS4.1 3-node head container
+	cd $(DS41X3_DIR) && ./start.sh logs
+
+stop-ds41x3: ## Stop the DS4.1 3-node lane (kit stop.sh; see the substring hazard above)
+	-cd $(DS41X3_DIR) && ./stop.sh
+
 ## --- dry-run / VRAM fit estimate (no launch) ------------------------------
 
 deepseek-dry: ## Estimate VRAM/context fit for DeepSeek-V4-Flash-Vision-Exp + DSpark
@@ -731,6 +792,8 @@ stop: ## Stop all workloads on the cluster (sparkrun lanes + the Qwen, qwen-flas
 	-cd $(DEEPSEEK_MIAAI_DIR) && ./stop-deepseek-v4-flash-dspark.sh
 	-[ -f $(DS4_TP3_ENV) ] && cd $(DEEPSEEK_MIAAI_DIR) && ENV_FILE=$(DS4_TP3_ENV) ./stop-deepseek-v4-flash-dspark.sh
 	-cd $(GLM_EXL3_DIR) && [ -f .env.tp3 ] && ./start-tp3.sh stop
+	-[ -e $(JSPARK3_RUNTIME)/service.json ] && $(MAKE) --no-print-directory stop-jspark3
+	-cd $(DS41X3_DIR) && [ -f .env ] && ./stop.sh
 	-cd $(DS41_DIR) && ./start.sh stop
 	-cd $(QWEN38FN_DIR) && ./stop.sh
 	-cd $(GLM_EXL3_DIR) && set -a && . ./.env && set +a && ./start.sh stop
