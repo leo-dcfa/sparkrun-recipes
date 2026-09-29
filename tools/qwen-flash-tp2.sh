@@ -4,7 +4,7 @@
 # LEO: this is upstream's single-spark-vllm-tp1/launch/qwen38fn-nvidia-tp2.sh (tonyd2wild/Qwen3.8-Flash-Next-NVFP4-DGX-Spark
 # LEO: @ 6ad1c8f, 2026-09-06) with this pair's deviations, each marked "LEO:" below. Everything else is verbatim upstream.
 # LEO:   1. LANE=leo (default): head 10.100.200.2 / worker 10.100.200.1 over the cross-wired CX7 link (head f0 / worker f1);
-# LEO:      NCCL_IB_HCA and the GLOO/NCCL/TP socket ifnames are derived per rank from the host IP instead of hard-coded rocep1s0f0.
+# LEO:      NCCL_IB_HCA and the GLOO/NCCL/TP socket ifnames are derived per rank from the host IP instead of hard-coded rocep1s0f1.
 # LEO:   2. THINKING=1|0 (default 1): server-side enable_thinking, like `make qwen38fn`. Upstream ships thinking OFF.
 # LEO:   3. PROFILE=speed|context (default speed): one word for upstream's CONTEXT knob set (PLE_MODE=mmap GRAPHS=piecewise MTP=4 SEQS=8 GMU=0.80 CHUNK=).
 # LEO:   4. CHECK=1: preflight only (image, checkpoint, patch files, RDMA device, resolved NICs) and exit 0/1 without launching.
@@ -51,7 +51,7 @@ case "$NODE_RANK" in
   1) HOST_IP="$WORKER_IP"; HEADLESS="--headless" ;;   # worker
   *) echo "rank must be 0 or 1" >&2; exit 2 ;;
 esac
-# LEO: resolve the NIC that owns HOST_IP and the RDMA device behind it (cross-wired CX7: head enp1s0f0np0/rocep1s0f0, worker enp1s0f1np1/rocep1s0f1).
+# LEO: resolve the NIC that owns HOST_IP and the RDMA device behind it (cross-wired CX7: head enp1s0f1np1/rocep1s0f1, worker enp1s0f0np0/rocep1s0f0).
 IFACE="${IFACE:-$(ip -o -4 addr show 2>/dev/null | awk -v ip="$HOST_IP/" 'index($4, ip)==1 {print $2; exit}')}"
 if [ -z "${HCA:-}" ] && [ -n "$IFACE" ]; then
   for d in /sys/class/infiniband/*; do

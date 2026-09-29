@@ -347,7 +347,7 @@ endif
 # @ 201be3e; clone at ~/src/mimo26-sglang-miaai on branch leo/worker-socket-ifname,
 # ONE local commit over upstream main: WORKER_GLOO_SOCKET_IFNAME /
 # WORKER_NCCL_SOCKET_IFNAME in start.sh, because this pair is cross-wired (head
-# enp1s0f0np0 <-> worker enp1s0f1np1) and the kit passes one socket ifname to both
+# enp1s0f1np1 <-> worker enp1s0f0np0) and the kit passes one socket ifname to both
 # ranks — gloo refuses a comma list naming a port the node lacks, tested. Update
 # with `git fetch && git rebase origin/main`, not --ff-only. Site profile = its
 # .env, every local value marked LEO; the kit reads ONLY that file, so knobs are
@@ -439,7 +439,7 @@ MIMO26_DIR        := $(HOME)/src/mimo26-sglang-miaai
 MIMO26_VLLM_DIR        := $(HOME)/src/mimo26-flash-tony
 MIMO26_VLLM_MODEL      := /var/tmp/models/MiMo-V2.6-Flash-RL
 MIMO26_VLLM_CACHE      := /var/tmp/mimo-cache
-MIMO26_VLLM_WORKER_ENV := IFACE=enp1s0f1np1 HCA=rocep1s0f1
+MIMO26_VLLM_WORKER_ENV := IFACE=enp1s0f0np0 HCA=rocep1s0f0
 
 # Optional overrides — set on the command line, e.g.
 # make deepseek MAX_MODEL_LEN=1000000 GPU_MEM=0.85
@@ -539,7 +539,7 @@ logs-ds41: ## Tail the DeepSeek-V4.1 EXL3 head container
 # sparkrun's two detect scripts substitute the up RDMA netdev for a wireless
 # default interface and its env builder emit VLLM_HOST_IP per host, so the whole
 # control plane rides the CX7 link like NCCL already does. Verify after a launch:
-#   docker inspect <node_0> | grep -E "VLLM_HOST_IP|GLOO_SOCKET_IFNAME" -> 10.100.200.2 / enp1s0f0np0
+#   docker inspect <node_0> | grep -E "VLLM_HOST_IP|GLOO_SOCKET_IFNAME" -> 10.100.200.2 / enp1s0f1np1
 #   grep mq_connect_ip /tmp/sparkrun_serve.log (in-container)         -> 10.100.200.2, not 192.168.0.120
 # Cabling the 10GbE ports would make the patch redundant (wired default route).
 glm-exl3: flush cache-flusher ## Launch GLM-5.3-Flash EXL3 4bpw + DFlash2 k=7 (MiaAI-Lab kit, 2-node, 850K ctx, FP8 dense + adaptive-k) — the GLM 5.3 lane
