@@ -484,11 +484,25 @@ RUN := $(SPARKRUN) run --cluster $(CLUSTER)
 # The worker node (node_1), addressed over the cluster link the way sparkrun does.
 WORKER ?= 10.100.200.1
 
+# 3-node lanes (2026-09-29): the Gigabyte AI TOP ATOM (aitopatom-4b9d, GB10) is rank 2.
+# CX7 directed ring, each node's Port0 -> the next node's Port1:
+#   spark-f31f P0 -> atom P1   10.100.210.0/24 (+ .211 on the second PCIe function)
+#   atom P0 -> spark-d306 P1   10.100.220.0/24 (+ .221)
+#   spark-d306 P0 -> f31f P1   10.100.200.0/24 (+ .201) = the 2-node link, same IPs as before
+# The netplan (MTU 9000, plus host routes so every fabric IP answers from every node) is
+# /home/leo/cx7-ring.sh on each node. flush/cache-flusher take WORKERS; the 3-node
+# targets pass both workers.
+WORKER2 ?= 10.100.210.3
+WORKERS ?= $(WORKER)
+WORKERS3 := $(WORKER) $(WORKER2)
+
 .PHONY: help deepseek deepseek-sparkrun ds41 ds41-status logs-ds41 stop-ds41 glm-exl3 qwen38fn qwen38fn-sglang qwen-flash qwen-flash-no-thinking qwen-flash-sync \
         mimo mimo-vllm mimo-vllm-sync mimo-vllm-sync-weights \
         deepseek-dry qwen38fn-dry qwen-flash-dry mimo-dry mimo-vllm-dry \
         stop stop-deepseek stop-glm-exl3 stop-qwen38fn stop-qwen38fn-sglang stop-qwen-flash stop-mimo stop-mimo-vllm \
-        status logs logs-glm-exl3 logs-qwen-flash logs-mimo logs-mimo-vllm list flush patch-sparkrun cache-flusher stop-cache-flusher
+        status logs logs-glm-exl3 logs-qwen-flash logs-mimo logs-mimo-vllm list flush patch-sparkrun cache-flusher stop-cache-flusher \
+        glm-exl3-tp3 glm-exl3-tp3-status stop-glm-exl3-tp3 logs-glm-exl3-tp3 \
+        deepseek-tp3 deepseek-tp3-prepare deepseek-tp3-env stop-deepseek-tp3 flush3 cache-flusher3 free-nfs
 # (qwen38fn, qwen38fn-dry, logs-qwen38fn left out on purpose: parked 2026-09-08, see the MiaAI block)
 
 help: ## Show this help
@@ -591,6 +605,57 @@ mimo-vllm-sync-weights: ## Copy the 166 GiB MiMo checkpoint to the worker over t
 	ssh -o BatchMode=yes -o ConnectTimeout=10 $(WORKER) 'mkdir -p $(MIMO26_VLLM_MODEL)'
 	rsync -a --exclude .cache --info=progress2 $(MIMO26_VLLM_MODEL)/ $(WORKER):$(MIMO26_VLLM_MODEL)/
 
+## --- 3-node lanes: spark-f31f + spark-d306 + aitopatom-4b9d ---------------
+#
+# One workload at a time across the whole ring: stop the 2-node lane first.
+# Only two kits have a TP=3 path (checked 2026-09-29): MiaAI's GLM EXL3
+# (start-tp3.sh) and MiaAI's DS4 DSpark (start-tp3.sh). Qwen Flash-Next, MiMo
+# and DS4.1 EXL3 are 2-node kits, and every tonyd2wild kit is TP2/TP4 — their
+# head/KV/expert counts do not divide by 3. Both lanes serve on :8000 under
+# their own name (…-tp3), so the dashboard and LiteLLM tell them apart.
+
+# MiMo's exporter (mimo26-nfs) holds the head's kernel nfsd, and GLM's
+# files/nfs-share.sh only adopts glm53-nfs / vllm-fn-nfs / glm53fp8-nfs /
+# dsv41-nfs, so it would start a second nfsd and fail. Drop MiMo's while MiMo
+# is not serving; stop-glm-exl3-tp3 drops glm53-nfs again, so `make mimo`
+# recreates its own exporter exactly as before.
+free-nfs:
+	@if docker ps --format '{{.Names}}' | grep -qx 'mimo26-tp2-head'; then echo "MiMo is serving: make stop-mimo first" >&2; exit 1; fi
+	@docker rm -f mimo26-nfs >/dev/null 2>&1 && echo "removed mimo26-nfs (make mimo recreates it)" || true
+
+# .env.tp3 in the kit (LEO 2026-09-29 comments): ranks 10.100.200.2 / .200.1 /
+# .210.3, dual-port CX7 pins on every rank, bootstrap on enP7s7, NFS_SHARE=1
+# (one 164 GiB copy; also dodges MiaAI #287), 40 GiB KV pin, 1M ctx, :8000.
+glm-exl3-tp3: flush3 cache-flusher3 free-nfs ## Launch GLM-5.3-Flash EXL3 on THREE nodes (MiaAI start-tp3.sh: TP=3 + EP, 1M ctx, served glm-5.3-flash-exl3-tp3)
+	cd $(GLM_EXL3_DIR) && ./start-tp3.sh start
+
+glm-exl3-tp3-status: ## Status of the 3-node GLM lane
+	cd $(GLM_EXL3_DIR) && ./start-tp3.sh status
+
+logs-glm-exl3-tp3: ## Tail the 3-node GLM head container
+	cd $(GLM_EXL3_DIR) && ./start-tp3.sh logs
+
+stop-glm-exl3-tp3: ## Stop the 3-node GLM lane (all three ranks) and its NFS exporter
+	-cd $(GLM_EXL3_DIR) && ./start-tp3.sh stop
+	-docker rm -f glm53-nfs 2>/dev/null
+
+# DS4 reads ONE env file (ENV_FILE overrides it). The 3-node lane runs from a
+# generated .env.dspark.tp3 = .env.dspark with tools/ds4-tp3.env's keys
+# replaced, so .env.dspark stays the single source of truth.
+DS4_TP3_ENV := $(DEEPSEEK_MIAAI_DIR)/.env.dspark.tp3
+
+deepseek-tp3-env:
+	@python3 tools/env-overlay.py $(DEEPSEEK_MIAAI_DIR)/.env.dspark tools/ds4-tp3.env $(DS4_TP3_ENV)
+
+deepseek-tp3-prepare: deepseek-tp3-env ## One-time for 3-node DeepSeek: verify/fill the checkpoint + image on both workers (DSPARK_WORKER_HF_NFS=0)
+	cd $(DEEPSEEK_MIAAI_DIR) && ENV_FILE=$(DS4_TP3_ENV) ./prepare-dspark-model-cache.sh --yes
+
+deepseek-tp3: flush3 cache-flusher3 deepseek-tp3-env ## Launch DeepSeek-V4-Flash-Vision-Exp + DSpark on THREE nodes (MiaAI start-tp3.sh, 8->9 group pad, served deepseek-v4-flash-vision-exp-tp3)
+	cd $(DEEPSEEK_MIAAI_DIR) && ENV_FILE=$(DS4_TP3_ENV) ./start-tp3.sh
+
+stop-deepseek-tp3: deepseek-tp3-env ## Stop the 3-node DeepSeek lane (all three ranks)
+	-cd $(DEEPSEEK_MIAAI_DIR) && ENV_FILE=$(DS4_TP3_ENV) ./stop-deepseek-v4-flash-dspark.sh
+
 ## --- dry-run / VRAM fit estimate (no launch) ------------------------------
 
 deepseek-dry: ## Estimate VRAM/context fit for DeepSeek-V4-Flash-Vision-Exp + DSpark
@@ -626,14 +691,16 @@ patch-sparkrun: ## Keep sparkrun's torch/gloo control plane off Wi-Fi (idempoten
 # checkpoint download ran on the head). Persisted now in
 # /etc/sysctl.d/99-spark-swappiness.conf on both nodes; this guard catches the
 # next time it is not. Fix: sudo sysctl vm.swappiness=0 on the node named.
-flush: ## Drop the page cache on both nodes (GB10 UMA: NVRM needs physically free memory for the KV slab); refuses if vm.swappiness != 0
-	@h=$$(cat /proc/sys/vm/swappiness); w=$$(ssh -o BatchMode=yes -o ConnectTimeout=10 $(WORKER) cat /proc/sys/vm/swappiness 2>/dev/null || echo unreachable); \
-	if [ "$$h" != "0" ] || [ "$$w" != "0" ]; then \
-	  echo "REFUSING TO LAUNCH: vm.swappiness is $$h on the head and $$w on the worker; both must be 0 (see the comment above flush:)." >&2; \
+flush: ## Drop the page cache on every node in WORKERS + the head (GB10 UMA: NVRM needs physically free memory for the KV slab); refuses if vm.swappiness != 0
+	@bad=""; h=$$(cat /proc/sys/vm/swappiness); [ "$$h" = "0" ] || bad="head=$$h"; \
+	for w in $(WORKERS); do s=$$(ssh -o BatchMode=yes -o ConnectTimeout=10 $$w cat /proc/sys/vm/swappiness 2>/dev/null || echo unreachable); \
+	  [ "$$s" = "0" ] || bad="$$bad $$w=$$s"; done; \
+	if [ -n "$$bad" ]; then \
+	  echo "REFUSING TO LAUNCH: vm.swappiness must be 0 on every node, got:$$bad (see the comment above flush:)." >&2; \
 	  echo "  fix: sudo sysctl vm.swappiness=0 && echo vm.swappiness=0 | sudo tee /etc/sysctl.d/99-spark-swappiness.conf   (on the node named)" >&2; exit 1; fi
 	sync; echo 3 | sudo -n tee /proc/sys/vm/drop_caches >/dev/null
-	ssh -o BatchMode=yes -o ConnectTimeout=10 $(WORKER) 'sync; echo 3 | sudo -n tee /proc/sys/vm/drop_caches >/dev/null'
-	@echo "MemAvailable after flush:"; grep MemAvailable /proc/meminfo; ssh -o BatchMode=yes $(WORKER) grep MemAvailable /proc/meminfo
+	for w in $(WORKERS); do ssh -o BatchMode=yes -o ConnectTimeout=10 $$w 'sync; echo 3 | sudo -n tee /proc/sys/vm/drop_caches >/dev/null' || exit 1; done
+	@echo "MemAvailable after flush:"; grep MemAvailable /proc/meminfo; for w in $(WORKERS); do ssh -o BatchMode=yes $$w grep MemAvailable /proc/meminfo; done
 
 # tonyd2wild's cache_flusher.sh (GLM repo @ 050081d, NVIDIA KB 5776 remedy),
 # adopted 2026-09-08 as tools/cache_flusher.sh: for 25 min after a launch it
@@ -643,19 +710,27 @@ flush: ## Drop the page cache on both nodes (GB10 UMA: NVRM needs physically fre
 # alongside every boot. Every launch target depends on it. A second start
 # replaces the first (pidfile); it exits on its own. Logs:
 # ~/bench/cache-flusher-<host>.log on each node.
-cache-flusher: ## Run tonyd2wild's page-cache flusher on both nodes for the next 25 min (flushes whenever Cached > 40 GiB)
-	rsync -a tools/cache_flusher.sh $(WORKER):cache_flusher.sh
+cache-flusher: ## Run tonyd2wild's page-cache flusher on the head + WORKERS for the next 25 min (flushes whenever Cached > 40 GiB)
+	for w in $(WORKERS); do rsync -a tools/cache_flusher.sh $$w:cache_flusher.sh || exit 1; done
 	nohup bash tools/cache_flusher.sh > /dev/null 2>&1 < /dev/null &
-	ssh -o BatchMode=yes -o ConnectTimeout=10 $(WORKER) 'nohup bash ~/cache_flusher.sh > /dev/null 2>&1 < /dev/null &'
-	@echo "cache flusher running on both nodes for 25 min (logs: ~/bench/cache-flusher-<host>.log)"
+	for w in $(WORKERS); do ssh -o BatchMode=yes -o ConnectTimeout=10 $$w 'nohup bash ~/cache_flusher.sh > /dev/null 2>&1 < /dev/null &'; done
+	@echo "cache flusher running on the head + $(WORKERS) for 25 min (logs: ~/bench/cache-flusher-<host>.log)"
 
-stop-cache-flusher: ## Stop the page-cache flusher on both nodes (it also exits by itself after 25 min)
+stop-cache-flusher: ## Stop the page-cache flusher on every node (it also exits by itself after 25 min)
 	-[ -f $(HOME)/.cache_flusher.pid ] && kill $$(cat $(HOME)/.cache_flusher.pid) 2>/dev/null; true
-	-ssh -o BatchMode=yes -o ConnectTimeout=10 $(WORKER) '[ -f ~/.cache_flusher.pid ] && kill $$(cat ~/.cache_flusher.pid) 2>/dev/null; true'
+	-for w in $(WORKERS3); do ssh -o BatchMode=yes -o ConnectTimeout=10 $$w '[ -f ~/.cache_flusher.pid ] && kill $$(cat ~/.cache_flusher.pid) 2>/dev/null; true'; done
 
-stop: ## Stop all workloads on the cluster (sparkrun lanes + the Qwen, qwen-flash, GLM-EXL3, DeepSeek and both MiMo kits)
+flush3: ## flush on all three nodes (the 3-node lanes' prerequisite)
+	@$(MAKE) --no-print-directory flush WORKERS="$(WORKERS3)"
+
+cache-flusher3: ## cache-flusher on all three nodes
+	@$(MAKE) --no-print-directory cache-flusher WORKERS="$(WORKERS3)"
+
+stop: ## Stop all workloads on the cluster (sparkrun lanes + the Qwen, qwen-flash, GLM-EXL3, DeepSeek and both MiMo kits, 2- and 3-node)
 	$(SPARKRUN) stop --all --cluster $(CLUSTER)
 	-cd $(DEEPSEEK_MIAAI_DIR) && ./stop-deepseek-v4-flash-dspark.sh
+	-[ -f $(DS4_TP3_ENV) ] && cd $(DEEPSEEK_MIAAI_DIR) && ENV_FILE=$(DS4_TP3_ENV) ./stop-deepseek-v4-flash-dspark.sh
+	-cd $(GLM_EXL3_DIR) && [ -f .env.tp3 ] && ./start-tp3.sh stop
 	-cd $(DS41_DIR) && ./start.sh stop
 	-cd $(QWEN38FN_DIR) && ./stop.sh
 	-cd $(GLM_EXL3_DIR) && set -a && . ./.env && set +a && ./start.sh stop
@@ -705,6 +780,7 @@ status: ## Show running sparkrun containers (+ the vllm-fn / qwen-flash / glm53-
 	@ssh -o BatchMode=yes -o ConnectTimeout=5 $(WORKER) "docker ps --filter name=mimo26-tp2-worker --format 'mimo (worker): {{.Status}}  {{.Image}}'" 2>/dev/null || true
 	@docker ps --filter name=vllm_mimo --format 'mimo-vllm (head):   {{.Status}}  {{.Image}}' 2>/dev/null || true
 	@ssh -o BatchMode=yes -o ConnectTimeout=5 $(WORKER) "docker ps --filter name=vllm_mimo --format 'mimo-vllm (worker): {{.Status}}  {{.Image}}'" 2>/dev/null || true
+	@ssh -o BatchMode=yes -o ConnectTimeout=5 $(WORKER2) "docker ps --format '{{.Names}} (worker2): {{.Status}}  {{.Image}}'" 2>/dev/null || true
 
 logs: ## Tail the running workload's logs (or a specific one: make logs TARGET=<job-id|recipe>)
 	@target="$(TARGET)"; \
