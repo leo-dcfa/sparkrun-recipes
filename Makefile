@@ -496,7 +496,7 @@ WORKER2 ?= 10.100.210.3
 WORKERS ?= $(WORKER)
 WORKERS3 := $(WORKER) $(WORKER2)
 
-.PHONY: help deepseek deepseek-sparkrun ds41 ds41-status logs-ds41 stop-ds41 glm-exl3 qwen38fn qwen38fn-sglang qwen-flash qwen-flash-no-thinking qwen-flash-sync \
+.PHONY: help deepseek deepseek-sparkrun ds41 ds41-status logs-ds41 stop-ds41 glm-exl3 glm-exl3-ablit glm-exl3-ablit-fetch glm-exl3-ablit-check qwen38fn qwen38fn-sglang qwen-flash qwen-flash-no-thinking qwen-flash-sync \
         mimo mimo-vllm mimo-vllm-sync mimo-vllm-sync-weights \
         deepseek-dry qwen38fn-dry qwen-flash-dry mimo-dry mimo-vllm-dry \
         stop stop-deepseek stop-glm-exl3 stop-qwen38fn stop-qwen38fn-sglang stop-qwen-flash stop-mimo stop-mimo-vllm \
@@ -560,6 +560,25 @@ logs-ds41: ## Tail the DeepSeek-V4.1 EXL3 head container
 # Cabling the 10GbE ports would make the patch redundant (wired default route).
 glm-exl3: flush cache-flusher ## Launch GLM-5.3-Flash EXL3 4bpw + DFlash2 k=7 (MiaAI-Lab kit, 2-node, 850K ctx, FP8 dense + adaptive-k) — the GLM 5.3 lane
 	cd $(GLM_EXL3_DIR) && set -a && . ./.env && set +a && ./start.sh start
+
+# ABLIT variant of the same lane (added 2026-09-30): MiaAI's runtime abliteration
+# (README "Abliteration (ABLIT=1)") — o_proj L15-45 byte-transplanted at load from
+# the dealign donor (L0-14 stock anchors; the DFlash2 drafter is never touched).
+# Same TR3 weights, image and .env as glm-exl3, nothing rewritten on disk. The FP8
+# dense pass (GLM53_DENSE_FP8=all covers o_proj) runs in process_weights_after_loading,
+# AFTER the load_weights hook, so the edit lands on BF16 and is then quantised.
+# .env is sourced with set -a, so ABLIT and the served name MUST ride on the
+# start.sh command line (a caller export beats .env). ABLIT_METHOD=transplant, not
+# auto: auto silently falls back to proj without ablit/transplant/, which garbles
+# sampled output. Stop with stop-glm-exl3 (same containers).
+glm-exl3-ablit-fetch: ## One-time: fetch the ablit o_proj transplant (~2.7 GiB of HF range reads) into the GLM kit's ablit/transplant/ — not while a 3-node lane serves
+	cd $(GLM_EXL3_DIR) && python3 ablit/fetch_transplant.py
+
+glm-exl3-ablit-check:
+	@test -f $(GLM_EXL3_DIR)/ablit/transplant/MANIFEST.json || { echo "$(GLM_EXL3_DIR)/ablit/transplant/ is missing: run make glm-exl3-ablit-fetch first" >&2; exit 1; }
+
+glm-exl3-ablit: glm-exl3-ablit-check flush cache-flusher ## Launch GLM-5.3-Flash EXL3 ABLITERATED (MiaAI ABLIT=1 transplant, o_proj L15-45; 2-node, 850K ctx; served glm-5.3-flash-exl3-ablit)
+	cd $(GLM_EXL3_DIR) && set -a && . ./.env && set +a && ABLIT=1 ABLIT_METHOD=transplant SERVED_MODEL_NAME=glm-5.3-flash-exl3-ablit ./start.sh start
 
 # UN-PARKED 2026-09-15 at Leo's request: this is the qwen-flash lane now.
 # Reconfigured off its old defaults — nvidia NVFP4 checkpoint (RadixArk is NOT
