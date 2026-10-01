@@ -504,7 +504,8 @@ WORKERS3 := $(WORKER) $(WORKER2)
         glm-exl3-tp3 glm-exl3-tp3-status stop-glm-exl3-tp3 logs-glm-exl3-tp3 \
         deepseek-tp3 deepseek-tp3-prepare deepseek-tp3-env stop-deepseek-tp3 flush3 cache-flusher3 free-nfs \
         jspark3 jspark3-verify jspark3-status logs-jspark3 stop-jspark3 \
-        ds41x3 ds41x3-build ds41x3-pack ds41x3-status logs-ds41x3 stop-ds41x3
+        ds41x3 ds41x3-build ds41x3-pack ds41x3-status logs-ds41x3 stop-ds41x3 \
+        glm-tf glm-tf-status logs-glm-tf stop-glm-tf
 # (qwen38fn, qwen38fn-dry, logs-qwen38fn left out on purpose: parked 2026-09-08, see the MiaAI block)
 
 help: ## Show this help
@@ -707,6 +708,29 @@ logs-jspark3: ## Tail the JSpark3 rank-0 container
 stop-jspark3: ## Stop AND remove JSpark3's three rank containers (a restart needs a fresh preflight anyway)
 	-$(JSPARK3_FLEET) stop --env-file ../operator.env --manifest ../service.json --confirm STOP-JSPARK3 --remove --remove-confirm REMOVE-JSPARK3 && mv $(JSPARK3_RUNTIME)/service.json $(JSPARK3_RUNTIME)/service-stopped-$$(date +%Y%m%dT%H%M%S).json
 	tools/jspark3-archive-evidence.sh $(WORKER) $(WORKER2)
+
+# GLM-5.3-Flash on TensorFold: MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold @ ed026ef
+# (Apache-2.0; TensorFold v0.5.0 + 52 patches; the DFlash2 draft it loads is CC BY-NC-ND), cloned
+# 2026-10-01 as ~/src/glm53-tensorfold-miaai. TWO nodes only (TensorFold runs GLM on exactly two
+# ranks): head f31f + worker d306 over 10.100.200.0/24. scripts/local.sh points it at the
+# brandonmusic TR3 4bpw snapshot both nodes already hold (the kit default is MiaAI byte-identical
+# mirror) and sets PREPARE=0; the prebuilt GHCR image (v0.5.0-cefe8bf45d07) was pulled by hand on
+# both nodes and tagged tensorfold-glm53:v0.5.0. API 0.0.0.0:8888 with NO auth, the same port as
+# JSpark3, so jspark3-api-guard covers it. Served GLM-5.3-Flash-EXL3, 1M ctx, 4 requests at once,
+# FP8 KV, 4-bit dense trunk; thinking on by default (no effort = max).
+GLM_TF_DIR := $(HOME)/src/glm53-tensorfold-miaai
+
+glm-tf: flush cache-flusher ## Launch GLM-5.3-Flash on TensorFold (MiaAI kit, 2-node, :8888, 1M ctx, served GLM-5.3-Flash-EXL3)
+	cd $(GLM_TF_DIR) && ./start.sh
+
+glm-tf-status: ## Is the TensorFold GLM lane serving (both ranks)?
+	@docker ps --filter name=glm53-flash-tf --format "head:   {{.Names}} {{.Status}}"; ssh -o BatchMode=yes $(WORKER) docker ps --filter name=glm53-flash-tf --format "\"worker: {{.Names}} {{.Status}}\""
+
+logs-glm-tf: ## Tail the TensorFold GLM rank-0 container
+	docker logs -f --tail 200 glm53-flash-tf
+
+stop-glm-tf: ## Stop the TensorFold GLM lane (both ranks)
+	-cd $(GLM_TF_DIR) && ./stop.sh
 
 # DeepSeek-V4.1-Flash NATIVE weights on three nodes: MiaAI-Lab/DeepSeek-v4.1-Flash-DGX-Sparks
 # @ cad252b (SGLang, AGPL-3.0; weights MIT), cloned 2026-09-29 as ~/src/ds41-sglang-miaai.
