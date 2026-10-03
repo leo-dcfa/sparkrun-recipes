@@ -505,7 +505,7 @@ WORKERS3 := $(WORKER) $(WORKER2)
         deepseek-tp3 deepseek-tp3-prepare deepseek-tp3-env stop-deepseek-tp3 flush3 cache-flusher3 free-nfs \
         jspark3 jspark3-verify jspark3-status logs-jspark3 stop-jspark3 \
         ds41x3 ds41x3-build ds41x3-pack ds41x3-status logs-ds41x3 stop-ds41x3 \
-        glm-tf glm-tf-status logs-glm-tf stop-glm-tf
+        glm-tf glm-tf-status logs-glm-tf stop-glm-tf glm-tf-tp3 glm-tf-tp3-dry glm-tf-tp3-status stop-glm-tf-tp3
 # (qwen38fn, qwen38fn-dry, logs-qwen38fn left out on purpose: parked 2026-09-08, see the MiaAI block)
 
 help: ## Show this help
@@ -723,14 +723,30 @@ GLM_TF_DIR := $(HOME)/src/glm53-tensorfold-miaai
 glm-tf: flush cache-flusher ## Launch GLM-5.3-Flash on TensorFold (MiaAI kit, 2-node, :8888, 1M ctx, served GLM-5.3-Flash-EXL3)
 	cd $(GLM_TF_DIR) && ./start.sh
 
-glm-tf-status: ## Is the TensorFold GLM lane serving (both ranks)?
+glm-tf-status: ## Is the TensorFold GLM lane serving (2 or 3 ranks)?
 	@docker ps --filter name=glm53-flash-tf --format "head:   {{.Names}} {{.Status}}"; ssh -o BatchMode=yes $(WORKER) docker ps --filter name=glm53-flash-tf --format "\"worker: {{.Names}} {{.Status}}\""
+	@ssh -o BatchMode=yes -o ConnectTimeout=5 $(WORKER2) docker ps --filter name=glm53-flash-tf --format "\"worker2: {{.Names}} {{.Status}}\"" 2>/dev/null || true
 
 logs-glm-tf: ## Tail the TensorFold GLM rank-0 container
 	docker logs -f --tail 200 glm53-flash-tf
 
-stop-glm-tf: ## Stop the TensorFold GLM lane (both ranks)
+stop-glm-tf: ## Stop the TensorFold GLM lane (2- or 3-node: the kit stop.sh stops every configured worker)
 	-cd $(GLM_TF_DIR) && ./stop.sh
+
+# 3 Sparks (kit v1.4, 2026-10-03, EXPERIMENTAL upstream): start-tp3.sh = start.sh with TP=3, the TP-N engine from the
+# kit's patches 0066-0068 (TensorFold v0.6.0 itself serves two ranks), same image as 2-node. scripts/local.sh: WORKER2 =
+# the Atom (10.100.210.3), MASTER_ADDR 10.100.200.2, SOCKET_IFNAME enP7s7, and only at TP=3 KV_POOL_GIB 27 (upstream's
+# measured value, not the default 32) + SERVED_NAME GLM-5.3-Flash-EXL3-TP3. Same container name and :8888 as glm-tf, so
+# stop-glm-tf / logs-glm-tf serve both. COMM=nccl (start-tp3.sh's default); weights copied to every worker.
+glm-tf-tp3: flush3 cache-flusher3 ## Launch GLM-5.3-Flash on TensorFold on THREE nodes (MiaAI kit v1.4 start-tp3.sh, experimental, :8888, 1M ctx, served GLM-5.3-Flash-EXL3-TP3)
+	cd $(GLM_TF_DIR) && ./start-tp3.sh
+
+glm-tf-tp3-dry: ## Print every rank's docker command and the links found for the 3-node TensorFold lane (DRY_RUN=1, changes nothing)
+	cd $(GLM_TF_DIR) && DRY_RUN=1 ./start-tp3.sh
+
+glm-tf-tp3-status: glm-tf-status ## Status of the 3-node TensorFold lane (all three ranks)
+
+stop-glm-tf-tp3: stop-glm-tf ## Stop the 3-node TensorFold lane (all three ranks)
 
 # DeepSeek-V4.1-Flash NATIVE weights on three nodes: MiaAI-Lab/DeepSeek-v4.1-Flash-DGX-Sparks
 # @ cad252b (SGLang, AGPL-3.0; weights MIT), cloned 2026-09-29 as ~/src/ds41-sglang-miaai.
@@ -830,7 +846,7 @@ flush3: ## flush on all three nodes (the 3-node lanes' prerequisite)
 cache-flusher3: ## cache-flusher on all three nodes
 	@$(MAKE) --no-print-directory cache-flusher WORKERS="$(WORKERS3)"
 
-stop: ## Stop all workloads on the cluster (sparkrun lanes + the Qwen, qwen-flash, GLM-EXL3, DeepSeek and both MiMo kits, 2- and 3-node)
+stop: ## Stop all workloads on the cluster (sparkrun lanes + the Qwen, qwen-flash, GLM-EXL3, GLM TensorFold, DeepSeek and both MiMo kits, 2- and 3-node)
 	$(SPARKRUN) stop --all --cluster $(CLUSTER)
 	-cd $(DEEPSEEK_MIAAI_DIR) && ./stop-deepseek-v4-flash-dspark.sh
 	-[ -f $(DS4_TP3_ENV) ] && cd $(DEEPSEEK_MIAAI_DIR) && ENV_FILE=$(DS4_TP3_ENV) ./stop-deepseek-v4-flash-dspark.sh
@@ -845,6 +861,7 @@ stop: ## Stop all workloads on the cluster (sparkrun lanes + the Qwen, qwen-flas
 	-docker rm -f vllm_mimo 2>/dev/null
 	-ssh -o BatchMode=yes -o ConnectTimeout=10 $(WORKER) docker rm -f vllm_mimo 2>/dev/null
 	-cd $(MIMO26_DIR) && ./stop.sh --no-wait
+	-cd $(GLM_TF_DIR) && ./stop.sh
 	-$(MAKE) --no-print-directory stop-cache-flusher
 
 stop-deepseek: ## Stop the DeepSeek lane (MiaAI kit; also clears the sparkrun rollback lane)
