@@ -496,7 +496,7 @@ WORKER2 ?= 10.100.210.3
 WORKERS ?= $(WORKER)
 WORKERS3 := $(WORKER) $(WORKER2)
 
-.PHONY: help deepseek deepseek-sparkrun ds41 ds41-status logs-ds41 stop-ds41 glm-exl3 glm-exl3-ablit glm-exl3-ablit-fetch glm-exl3-ablit-check qwen38fn qwen38fn-sglang qwen-flash qwen-flash-no-thinking qwen-flash-sync \
+.PHONY: help glm-full glm-full-nfs glm-full-prepare glm-full-dry glm-full-status logs-glm-full stop-glm-full deepseek deepseek-sparkrun ds41 ds41-status logs-ds41 stop-ds41 glm-exl3 glm-exl3-ablit glm-exl3-ablit-fetch glm-exl3-ablit-check qwen38fn qwen38fn-sglang qwen-flash qwen-flash-no-thinking qwen-flash-sync \
         mimo mimo-vllm mimo-vllm-sync mimo-vllm-sync-weights \
         deepseek-dry qwen38fn-dry qwen-flash-dry mimo-dry mimo-vllm-dry \
         stop stop-deepseek stop-glm-exl3 stop-qwen38fn stop-qwen38fn-sglang stop-qwen-flash stop-mimo stop-mimo-vllm \
@@ -748,6 +748,38 @@ glm-tf-tp3-status: glm-tf-status ## Status of the 3-node TensorFold lane (all th
 
 stop-glm-tf-tp3: stop-glm-tf ## Stop the 3-node TensorFold lane (all three ranks)
 
+# FULL GLM-5.3 (not Flash) on TensorFold, THREE nodes only: MiaAI-Lab/GLM-5.3-EXL3-3x-DGX-Sparks-TensorFold @ 885f5c8
+# (cloned 2026-10-05, reviewed: patches 0001-0068 = the Flash kit's, 0100-0141 engine-only). Checkpoint
+# Mia-AiLab/GLM-5.3-EXL3-2.75bpw-TensorFold @ 2d747d0e (272.7 GiB, pinned in scripts/local.sh: the kit floats on main),
+# HEAD ONLY: workers read their shares from the head over NFS (CX7 links), via the GLM EXL3 kit's glm53-nfs exporter
+# (HF cache ro, NFSv4 root fsid=0 -> NFS_PATH=/, clients d306 + Atom only), started with the lane and stopped with it.
+# Image tensorfold-glm53-full:v0.6.0 = FAST build on the Flash image digest (the full GHCR package is private: PULL=0).
+# Exclusive: ~85 GiB weights a rank. :8888 (jspark3-api-guard), served GLM-5.3-EXL3, 499,712 ctx fp4 KV CP=1, 1 request.
+GLM_FULL_DIR := $(HOME)/src/glm53full-tensorfold-miaai
+
+glm-full-nfs: free-nfs
+	@docker start glm53-nfs >/dev/null 2>&1 && echo "glm53-nfs exporting ~/.cache/huggingface (ro) to d306 + Atom" || { echo "glm53-nfs container missing: recreate it from the GLM EXL3 kit" >&2; exit 1; }
+
+glm-full-prepare: glm-full-nfs ## One-time / new-patches setup for full GLM-5.3: image on every Spark, 273 GiB download (head), NFS mounts, kernels
+	cd $(GLM_FULL_DIR) && PULL=0 scripts/prepare.sh
+
+glm-full: flush3 cache-flusher3 glm-full-nfs ## Launch FULL GLM-5.3 on TensorFold (MiaAI kit, THREE nodes, :8888, 499,712 ctx, served GLM-5.3-EXL3)
+	cd $(GLM_FULL_DIR) && PULL=0 ./start.sh
+
+glm-full-dry: ## Print every rank's docker command for the full GLM-5.3 lane (DRY_RUN=1, changes nothing)
+	cd $(GLM_FULL_DIR) && DRY_RUN=1 PULL=0 ./start.sh
+
+glm-full-status: ## Is the full GLM-5.3 lane serving (3 ranks)?
+	@docker ps --filter name=glm53-full-tf --format "head:    {{.Names}} {{.Status}}"; ssh -o BatchMode=yes $(WORKER) docker ps --filter name=glm53-full-tf --format "\"worker:  {{.Names}} {{.Status}}\""
+	@ssh -o BatchMode=yes -o ConnectTimeout=5 $(WORKER2) docker ps --filter name=glm53-full-tf --format "\"worker2: {{.Names}} {{.Status}}\"" 2>/dev/null || true
+
+logs-glm-full: ## Tail the full GLM-5.3 rank-0 container
+	docker logs -f --tail 200 glm53-full-tf
+
+stop-glm-full: ## Stop the full GLM-5.3 lane (all three ranks) and its NFS exporter
+	-cd $(GLM_FULL_DIR) && ./stop.sh
+	-docker stop glm53-nfs >/dev/null 2>&1
+
 # DeepSeek-V4.1-Flash NATIVE weights on three nodes: MiaAI-Lab/DeepSeek-v4.1-Flash-DGX-Sparks
 # @ cad252b (SGLang, AGPL-3.0; weights MIT), cloned 2026-09-29 as ~/src/ds41-sglang-miaai.
 # Full local checkpoint on every node (NFS_SHARE=0: its exporter would fight mimo26-nfs /
@@ -862,6 +894,7 @@ stop: ## Stop all workloads on the cluster (sparkrun lanes + the Qwen, qwen-flas
 	-ssh -o BatchMode=yes -o ConnectTimeout=10 $(WORKER) docker rm -f vllm_mimo 2>/dev/null
 	-cd $(MIMO26_DIR) && ./stop.sh --no-wait
 	-cd $(GLM_TF_DIR) && ./stop.sh
+	-cd $(GLM_FULL_DIR) && ./stop.sh
 	-$(MAKE) --no-print-directory stop-cache-flusher
 
 stop-deepseek: ## Stop the DeepSeek lane (MiaAI kit; also clears the sparkrun rollback lane)
