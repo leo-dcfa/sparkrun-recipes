@@ -503,7 +503,6 @@ WORKERS3 := $(WORKER) $(WORKER2)
         status logs logs-glm-exl3 logs-qwen-flash logs-mimo logs-mimo-vllm list flush patch-sparkrun cache-flusher stop-cache-flusher \
         glm-exl3-tp3 glm-exl3-tp3-status stop-glm-exl3-tp3 logs-glm-exl3-tp3 \
         deepseek-tp3 deepseek-tp3-prepare deepseek-tp3-env stop-deepseek-tp3 flush3 cache-flusher3 free-nfs \
-        jspark3 jspark3-verify jspark3-status logs-jspark3 stop-jspark3 \
         ds41x3 ds41x3-build ds41x3-pack ds41x3-status logs-ds41x3 stop-ds41x3 \
         glm-tf glm-tf-status logs-glm-tf stop-glm-tf glm-tf-tp3 glm-tf-tp3-dry glm-tf-tp3-status stop-glm-tf-tp3
 # (qwen38fn, qwen38fn-dry, logs-qwen38fn left out on purpose: parked 2026-09-08, see the MiaAI block)
@@ -678,45 +677,14 @@ deepseek-tp3: flush3 cache-flusher3 deepseek-tp3-env ## Launch DeepSeek-V4-Flash
 stop-deepseek-tp3: deepseek-tp3-env ## Stop the 3-node DeepSeek lane (all three ranks)
 	-cd $(DEEPSEEK_MIAAI_DIR) && ENV_FILE=$(DS4_TP3_ENV) ./stop-deepseek-v4-flash-dspark.sh
 
-# JSpark3 v1.8.4 (github.com/jakejharris/jspark3 @ 64220b0, Apache-2.0 + AGPL parts; the
-# DFlash2 draft it always loads is CC BY-NC-ND). GLM-5.3-Flash stock weights, TP3 + EP on
-# all three GB10s, its own image built on the head. Source + prepared runtime (operator.env,
-# receipts) live in ~/jspark3/src on f31f; each rank has ~/jspark3/{recipe-v1.8.4,models,
-# sources,work}. LOCAL PATCH: the prepared recipe's remote_preflight.py also accepts DMI
-# "AI TOP ATOM" (the Atom, same P4242 board) and its SHA256SUMS were re-sealed; the upstream
-# originals sit beside it as *.upstream-v1.8.4. Fixed by the recipe: API 0.0.0.0:8888 with
-# NO auth (jspark3-api-guard.service on f31f limits who can reach it), headless hosts
-# (multi-user.target, nvidia-drm modeset=1 fbdev=0), served name glm-5.3-flash.
-# A restart is always stop --remove + fresh preflight + start (~13 min).
-JSPARK3_RUNTIME := $(HOME)/jspark3/src/jspark3-runtime-v1.8.4
-JSPARK3_FLEET   := cd $(JSPARK3_RUNTIME)/recipe && python3 -B scripts/fleetctl.py
-
-jspark3: flush3 ## Launch JSpark3 v1.8.4 on THREE nodes (GLM-5.3-Flash TP3, :8888, served glm-5.3-flash; preflight ~5 min + start ~8 min)
-	@if [ -e $(JSPARK3_RUNTIME)/service.json ]; then echo "JSpark3 is running (service.json exists): make stop-jspark3 first" >&2; exit 1; fi
-	$(JSPARK3_FLEET) preflight --env-file ../operator.env --output ../preflight.json
-	$(JSPARK3_FLEET) start --env-file ../operator.env --preflight ../preflight.json --preflight-sha256 $$(sha256sum ../preflight.json | cut -d' ' -f1) --manifest ../service.json --confirm START-JSPARK3
-
-jspark3-verify: ## JSpark3's own end-to-end verify (health, correctness, >32K retrieval, memory/no-swap)
-	$(JSPARK3_FLEET) verify --env-file ../operator.env --manifest ../service.json --output ../verify.json --log-output ../verify-rank0.log
-
-jspark3-status: ## Status of the JSpark3 fleet
-	$(JSPARK3_FLEET) status --env-file ../operator.env --manifest ../service.json
-
-logs-jspark3: ## Tail the JSpark3 rank-0 container
-	docker logs -f --tail 200 jspark3-v16-rank0
-
-stop-jspark3: ## Stop AND remove JSpark3's three rank containers (a restart needs a fresh preflight anyway)
-	-$(JSPARK3_FLEET) stop --env-file ../operator.env --manifest ../service.json --confirm STOP-JSPARK3 --remove --remove-confirm REMOVE-JSPARK3 && mv $(JSPARK3_RUNTIME)/service.json $(JSPARK3_RUNTIME)/service-stopped-$$(date +%Y%m%dT%H%M%S).json
-	tools/jspark3-archive-evidence.sh $(WORKER) $(WORKER2)
-
 # GLM-5.3-Flash on TensorFold: MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold @ ed026ef
 # (Apache-2.0; TensorFold v0.5.0 + 52 patches; the DFlash2 draft it loads is CC BY-NC-ND), cloned
 # 2026-10-01 as ~/src/glm53-tensorfold-miaai. TWO nodes only (TensorFold runs GLM on exactly two
 # ranks): head f31f + worker d306 over 10.100.200.0/24. scripts/local.sh points it at the
 # brandonmusic TR3 4bpw snapshot both nodes already hold (the kit default is MiaAI byte-identical
 # mirror) and sets PREPARE=0; the prebuilt GHCR image (v0.5.0-cefe8bf45d07) was pulled by hand on
-# both nodes and tagged tensorfold-glm53:v0.5.0. API 0.0.0.0:8888 with NO auth, the same port as
-# JSpark3, so jspark3-api-guard covers it. Served GLM-5.3-Flash-EXL3, 1M ctx, 4 requests at once,
+# both nodes and tagged tensorfold-glm53:v0.5.0. API 0.0.0.0:8888 with NO auth; jspark3-api-guard
+# (nft on f31f, outlived JSpark3 itself) covers it. Served GLM-5.3-Flash-EXL3, 1M ctx, 4 requests at once,
 # FP8 KV, 4-bit dense trunk; thinking on by default (no effort = max).
 GLM_TF_DIR := $(HOME)/src/glm53-tensorfold-miaai
 
@@ -883,7 +851,6 @@ stop: ## Stop all workloads on the cluster (sparkrun lanes + the Qwen, qwen-flas
 	-cd $(DEEPSEEK_MIAAI_DIR) && ./stop-deepseek-v4-flash-dspark.sh
 	-[ -f $(DS4_TP3_ENV) ] && cd $(DEEPSEEK_MIAAI_DIR) && ENV_FILE=$(DS4_TP3_ENV) ./stop-deepseek-v4-flash-dspark.sh
 	-cd $(GLM_EXL3_DIR) && [ -f .env.tp3 ] && ./start-tp3.sh stop
-	-[ -e $(JSPARK3_RUNTIME)/service.json ] && $(MAKE) --no-print-directory stop-jspark3
 	-cd $(DS41X3_DIR) && [ -f .env ] && ./stop.sh
 	-cd $(DS41_DIR) && ./start.sh stop
 	-cd $(QWEN38FN_DIR) && ./stop.sh
